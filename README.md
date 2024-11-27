@@ -173,11 +173,54 @@ Now we can see that our Kubernetes nodes have a status of Ready and are operatio
 
 # Install Sample Application
 
+For this lab, we will be deploying an application called "Yet Another Online Bank" (yaobank). The application will consist of 3 microservices.
+
+Yet Another Online Bank diagram. Customer to Summary to Database connectivity.
+
+Customer (which provides a simple web GUI)
+Summary (some middleware business logic)
+Database (the persistent datastore for the bank)
+All the Kubernetes resources (Deployments, Pods, Services, Service Accounts, etc) for Yaobank will all be created within the yaobank namespace.
+
+### Installing the Sample Application
+
+If you are not already on host1, you can enter host1 by using the multipass shell command.  
+```multipass shell host1```
+
+To install yaobank into your kubernetes cluster, apply the following manifest:
+```
+kubectl apply -f https://raw.githubusercontent.com/tigera/ccol1/main/yaobank.yaml
+```
+
+### Verify the Sample Application
+
+Check the Deployment Status
+To validate that the application has been deployed into your cluster, we will check the rollout status of each of the microservices.
+
+Check the customer microservice: 
+
+```
+kubectl rollout status -n yaobank deployment/customer
+```
+
+### Access the Sample Application Web GUI
+Now we can browse to the service using the service’s NodePort. The NodePort exists on every node in the cluster. We’ll use the control node, but you get the exact same behavior connecting to any other node in the cluster.  
+
+```curl 198.19.0.1:30180```
+
+The resulting output should contain the following balance information:
+```
+  <body>
+        <h1>Welcome to YAO Bank</h1>
+        <h2>Name: Spike Curtis</h2>
+        <h2>Balance: 2389.45</h2>
+        <p><a href="/logout">Log Out >></a></p>
+  </body>
+```
+Congratulations! You're ready to proceed to the next module: Managing Your Lab.
 
 
-
-
-### Calico in Kubernetes
+# Calico in Kubernetes
 
 Core Principles
 1.  Every pod gets its own IP address.
@@ -185,9 +228,8 @@ Core Principles
 3.  Pods can commuincate with other pods in cluster using the IP address without (NAT) Network Adress Translation. That is the IPs are preserved across the pod network.
 4.  Network Isolation that restict each pod can communicate with defines using Network Policy.
 
-<img width="1031" alt="image" src="https://github.com/user-attachments/assets/610d5cf4-3539-4531-92e3-9e7f8b9cd3e0">
 
-### Kubernetes Network Implementation
+## Kubernetes Network Implementation
 
 **KubeNet** is default network solution in K8s which provides the basic network connectivity.
 
@@ -202,19 +244,17 @@ Different kinds of CNI plugins can be chained together.
  3. Network Policy Management.
  4. Perfomance & Encryption.
 
-### Workflow -
-Pod IP allocation
+## Workflow - Pod IP allocation  
+
 1. When a new pod is created in K8s, Kubelet call the Calico Network Plugin.
 2. The Calico Network Plugin invokes the Calico IPAM Plugin.
 3. The IPAM Plugin allocates the IP address for the pod and returns the IP to the Network plugin.
 4. The Network plugin set the pod's Networking with the new IP address allocated and connects it to the  K8s pod network.
 5. After updating the pod resource, the IP details are shared with kubelet.
-<br>
-  <img width="1031" alt="image" src="https://github.com/user-attachments/assets/93adab3a-7e69-42a3-9aec-0334d1869a16">
-
 
 Calico's flexible design allows it to run with a range other CNI plugins.<br>
 For Example:
 1. Host-Local IPAM CNI Plugin, used by GKE.
 2. Amazon CNI Plugin.
 3. Azure CNI Plugin.
+
