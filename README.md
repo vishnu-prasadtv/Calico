@@ -1,9 +1,179 @@
-# Calico Lab installation
+# Calico in Kubernetes 
 
-**Pre-requisites** - Install [Multipass](https://multipass.run) 
+*Kubernetes Network Model:*
+
+Core Principles
+1.  Every pod gets its own IP address.
+2.  Containers within the pod can share that IP address and communicate freely with each other.
+3.  Pods can communicate with other pods in cluster using the IP address without (NAT) Network Adress Translation. That is the IPs are preserved across the pod network.
+4.  Network Isolation that restict each pod can communicate with defines using Network Policy.
+5.  Referred as Flat Network. This simplifies the network, and allows new workloads to be scheduled dynamically anywhere in the cluster with no dependecies on the network design
+6.  Security is defined by Network Policy instead of conventional Network Topology.
+7.  The Kubernetes network model requires L3 (IP) connectivity only. Pods may be in the same CIDR, but are normally not strictly in the same subnet as they don't have L2 connectivity.
+8.  Kubernetes supports network plugins using CNI API.
+
+
+## Kubernetes Network Implementation 
+
+**KubeNet** is default network solution in K8s which provides the basic network connectivity.
+
+Calico is 3rd party Network Implementation in K8s which can be plugged in using CNI [Container Network Interface] API. 
+CNI config files are used to determine which CNI plugins to run.
+
+Different kinds of CNI plugins can be chained together.
+*For Example:*
+ 1. Network Connecivity - Calico Network Plugin.
+ 2. IP Address Management (IPAM) - Calico IPAM Plugin.
+ 3. Network Policy Management.
+ 4. Perfomance & Encryption.
+
+## Workflow - Pod IP allocation  
+
+1. When a new pod is created in K8s, Kubelet call the Calico Network Plugin.
+2. The Calico Network Plugin invokes the Calico IPAM Plugin.
+3. The IPAM Plugin allocates the IP address for the pod and returns the IP to the Network plugin.
+4. The Network plugin set the pod's Networking with the new IP address allocated and connects it to the  K8s pod network.
+5. After updating the pod resource, the IP details are shared with kubelet.
+
+Calico's flexible design allows it to run with a range other CNI plugins.<br>
+For Example:
+1. Host-Local IPAM CNI Plugin, used by GKE.
+2. Amazon CNI Plugin.
+3. Azure CNI Plugin.
+
+Where calico can provide the Network Policy and Complimentary Networking capabilities like Performance improvement and Encryption.
+
+## Kubernetes Services
+
+- K8s services provides a way of abstracting access to a group of pods as a networks service.
+- Group of pods backing each service, is usually defined using Label selector.
+- The Kubernetes network model does specify that pods can communicate with each other directly without NAT. But a pod communicating with another pod via a service is not direct communication, and **normally will use NAT to change the connection destination from the service to the backing pod as part of load balancing**.
+- When a client connects to K8s service, the conection is intercepted and load balanced to one of the pods backing the service. as illustrated below:
+
+![image](https://github.com/user-attachments/assets/74deed50-06d0-43a5-9c6a-fc7bed581290)
+
+#  Types of services
+
+**ClusterIP Service**
+- Is the usual way of accessing services from inside the cluster.
+- ClusterIP is the virtual IP adrdess used to represent the service.
+- The Pod can find the ClusterIP using DNS.
+- The Client Pod-A tries to connect to the ClusterIP, then thhe Kube-Proxy intercepts the connection, and load balances the it to one of the destination Pod-B.
+
+![image](https://github.com/user-attachments/assets/d3999f46-9319-45af-aa22-92da7756afff)
+
+**NodePort Services**
+- Is the Basic way of accessing a service from outside of the cluster.
+- Node port is a port reserved on each node in the cluster through which the service can be accessed.
+- Here a client outside cluster can connect to the node port on any if the Nodes in the cluster.
+- Then the Kube-Proxy will intercept the connection, and load balance it to a backing Pod.
+
+![image](https://github.com/user-attachments/assets/bbc3545f-cfe2-4895-b982-d4983655329c)
+
+**LoadBalancer Services**
+
+- This service use a Load balancer as a layer infront of the Node Ports, to provide a more sophistaicated way to access the cluster from outside.
+
+![image](https://github.com/user-attachments/assets/75622f0c-ac1b-48dc-bbd9-c0457f85b160)
+
+## Kubernetes DNS
+- It is the built-in DNS service in K8s.
+- It is implemented as a K8s service, that maps to one or more DNS server pods, usually running CoreDNS pods.
+- Every Pods and Service is discoverable though the Kubernetes DNS service.
+
+For example- 
+- Querying a service name returns the service ClusterIP.
+- The pods in the cluster are configured with a DNS search list that includes the pod's own namespace and the cluster's default domain name.
+   - If the pod is in the same namespace as the service, it can just use the service's name without needing to know which namespace and which cluster its running in.
+
+![image](https://github.com/user-attachments/assets/92d608d1-d760-4d2d-b830-607f50a278c1)
+
+
+## Outgoing NAT
+
+**Example:**
+
+If the pod network is an Overlay network, when a pod tries to connect to an external server outside the cluster:
+- The connection is intercepted and the Network Address Translation is used to map the pod's source IP to node's IP.
+- The packet can then traverse rest of the external network to where ever the destination is.
+- The return packets on the connection can get mapped back automatically from the nodeIP back to the Pod IP address.
+- And the external server is unaware that its talking to a pod, rather than to a node.
+
+![image](https://github.com/user-attachments/assets/ed03d8dd-bc7c-48f0-8725-0d46bf15eca8)
+
+## IPV6 and Dual stack
+
+- In case of Dual stack all pods will be assigned with an IPV4 address and a IPV6 address.
+- And each K8s service can be specified if needs to  be exposed to IPV4 or IPV6.
+- Calico supports IPV4, IPV6 and Dual stack.
+
+
+# Network Policy
+
+- Is the Primary tool used for securing a Kubernetes network.
+- It allows you to easily restrict the network traffic in you cluster.
+- So only the desired traffic is allowed.
+
+### History of Network Security
+
+- In enterprise env, the security was provided by designing a physical topology of network devices such as SWITCHES, ROUTERS and FIREWALLS.
+- Adding new application or services often required additional network design to update the network topology to provide the desired security.
+
+![image](https://github.com/user-attachments/assets/c2b3256b-30a5-4b15-8e42-720a71c5a4da)
+
+## Features of Network Policy?
+
+- Referred as Flat Network. This simplifies the network, and allows new workloads to be scheduled dynamically anywhere in the cluster with no dependecies on the network design
+- Security is defined by Network Policy instead of conventional Network Topology.
+- Network Policies are further abstracted from network, by using label selectors as their primary mechanism for identifying workloads rather than IP address ranges.
+- K8s defines a standard network policy API, so there is a base set of features
+
+![image](https://github.com/user-attachments/assets/10c6d1a3-9e7a-45a9-b194-7fa67f143695)
+
+## Why Network Policy?
+
+- Cyber atacks are more sophisticated and more in volume.
+- Traditional firewalls struggle with Dynamic nature of K8s.
+- Now in K8s you can use Firewalls at the perimeter to help secure the north-south traffic [Client-Cluster communication].
+- Security can be coarse-grained using IP address range of the whole cluster.
+- Calico Enterprise can be integrated with Fortinet firewalls, so as to understand the ingress node or pod IP addresses.
+- But these firewalls are not suitable for the east-west traffic enforcement within the cluster.
+
+- Network policy is label selector based -> inherently dynamic.
+
+- Empowers teams to adopt "shift left" security practices
+
+
+
+
+
+
+
+----------------------------------------------------------------------
+
+
+
+# Calico Installation and Lab creation
 
 ![image](https://github.com/user-attachments/assets/8d8bc2fc-063b-41dd-aef3-c87ca526476e)
 
+Broadly there are 4 different approaches to install.
+
+**Manifest**:-  
+This is the most basic method for installing Calico. The Calico docs include a range of manifests for different environments. If you are an advanced user, you can customize the manifests to give you ultimate flexibility and control over your installation. 
+
+**Operator**:-  
+Calico 3.15 introduces the option to install Calico using an open-source operator, created by Tigera. This offers simplification for installing and configuring Calico without needing to customize manifests. Additionally, the operator allows you to have a uniform, self-healing environment. Using the Tigera operator is highly recommended.
+
+**Managed Kubernetes Services**:-    
+Support for Calico is included with many of the most popular managed Kubernetes services (e.g. EKS, AKS, GKE, IKS), either enabled by default, or optionally enabled using the cloud provider’s management consoles or command line tools, depending on the specific managed Kubernetes service.
+
+**Kubernetes Distros and Installers**:-   
+Many Kubernetes distros and installers include support for installing Calico. (e.g. kops, kubespray, microk8s, etc). Most of these currently use manifest based installs under the covers.
+
+# Calico Lab installation using Operator Method 
+
+**Pre-requisites** - Install [Multipass](https://multipass.run) 
 
 ### Quick start - Create Cluster 
 If you’re on Linux, Mac, or have access to a Bash shell on Windows you can follow these steps to get up and running quickly:
@@ -222,107 +392,3 @@ The resulting output should contain the following balance information:
 ```
 
 
-# Calico in Kubernetes -
-
-*Kubernetes Network Model:*
-
-Core Principles
-1.  Every pod gets its own IP address.
-2.  Containers within the pod can share that IP address and communicate freely with each other.
-3.  Pods can communicate with other pods in cluster using the IP address without (NAT) Network Adress Translation. That is the IPs are preserved across the pod network.
-4.  Network Isolation that restict each pod can communicate with defines using Network Policy.
-5.  Referred as Flat Network.
-
-
-## Kubernetes Network Implementation 
-
-**KubeNet** is default network solution in K8s which provides the basic network connectivity.
-
-Calico is 3rd party Network Implementation in K8s which can be plugged in using CNI [Container Network Interface] API. 
-CNI config files are used to determine which CNI plugins to run.
-
-Different kinds of CNI plugins can be chained together.
-*For Example:*
- 1. Network Connecivity - Calico Network Plugin.
- 2. IP Address Management (IPAM) - Calico IPAM Plugin.
- 3. Network Policy Management.
- 4. Perfomance & Encryption.
-
-## Workflow - Pod IP allocation  
-
-1. When a new pod is created in K8s, Kubelet call the Calico Network Plugin.
-2. The Calico Network Plugin invokes the Calico IPAM Plugin.
-3. The IPAM Plugin allocates the IP address for the pod and returns the IP to the Network plugin.
-4. The Network plugin set the pod's Networking with the new IP address allocated and connects it to the  K8s pod network.
-5. After updating the pod resource, the IP details are shared with kubelet.
-
-Calico's flexible design allows it to run with a range other CNI plugins.<br>
-For Example:
-1. Host-Local IPAM CNI Plugin, used by GKE.
-2. Amazon CNI Plugin.
-3. Azure CNI Plugin.
-
-Where calico can provide the Network Policy and Complimentary Networking capabilities like Performance improvement and Encryption.
-
-## Kubernetes Services
-
-- K8s services provides a way of abstracting access to a group of pods as a networks service.
-- Group of pods backing each service, is usually defined using Label selector. 
-- When a client connects to K8s service, the conection is intercepted and load balanced to one of the pods backing the service. as illustrated below:
-
-![image](https://github.com/user-attachments/assets/74deed50-06d0-43a5-9c6a-fc7bed581290)
-
-#  Types of services
-
-**ClusterIP Service**
-- Is the usual way of accessing services from inside the cluster.
-- ClusterIP is the virtual IP adrdess used to represent the service.
-- The Pod can find the ClusterIP using DNS.
-- The Client Pod-A tries to connect to the ClusterIP, then thhe Kube-Proxy intercepts the connection, and load balances the it to one of the destination Pod-B.
-
-![image](https://github.com/user-attachments/assets/d3999f46-9319-45af-aa22-92da7756afff)
-
-**NodePort Services**
-- Is the Basic way of accessing a service from outside of the cluster.
-- Node port is a port reserved on each node in the cluster through which the service can be accessed.
-- Here a client outside cluster can connect to the node port on any if the Nodes in the cluster.
-- Then the Kube-Proxy will intercept the connection, and load balance it to a backing Pod.
-
-![image](https://github.com/user-attachments/assets/bbc3545f-cfe2-4895-b982-d4983655329c)
-
-**LoadBalancer Services**
-
-- This service use a Load balancer as a layer infront of the Node Ports, to provide a more sophistaicated way to access the cluster from outside.
-
-![image](https://github.com/user-attachments/assets/75622f0c-ac1b-48dc-bbd9-c0457f85b160)
-
-## Kubernetes DNS
-- It is the built-in DNS service in K8s.
-- It is implemented as a K8s service, that maps to one or more DNS server pods, usually running CoreDNS pods.
-- Every Pods and Service is discoverable though the Kubernetes DNS service.
-
-For example- 
-- Querying a service name returns the service ClusterIP.
-- The pods in the cluster are configured with a DNS search list that includes the pod's own namespace and the cluster's default domain name.
-   - If the pod is in the same namespace as the service, it can just use the service's name without needing to know which namespace and which cluster its running in.
-
-![image](https://github.com/user-attachments/assets/92d608d1-d760-4d2d-b830-607f50a278c1)
-
-
-## Outgoing NAT
-
-**Example:**
-
-If the pod network is an Overlay network, when a pod tries to connect to an external server outside the cluster:
-- The connection is intercepted and the Network Address Translation is used to map the pod's source IP to node's IP.
-- The packet can then traverse rest of the external network to where ever the destination is.
-- The return packets on the connection can get mapped back automatically from the nodeIP back to the Pod IP address.
-- And the external server is unaware that its talking to a pod, rather than to a node.
-
-![image](https://github.com/user-attachments/assets/ed03d8dd-bc7c-48f0-8725-0d46bf15eca8)
-
-## IPV6 and Dual stack
-
-- In case of Dual stack all pods will be assigned with an IPV4 address and a IPV6 address.
-- And each K8s service can be specified if needs to  be exposed to IPV4 or IPV6.
-- Calico supports IPV4, IPV6 and Dual stack.
