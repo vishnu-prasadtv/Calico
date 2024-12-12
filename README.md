@@ -141,12 +141,94 @@ If the pod network is an Overlay network, when a pod tries to connect to an exte
 
 - Network policy is label selector based -> inherently dynamic.
 
-- Empowers teams to adopt "shift left" security practices
+- Empowers teams to adopt "shift left" security practices- Developers and operations teams who are not networking experts have the ability to implement security themselves.
+
+## Kubernetes Network Policy
+- The API group belongs to the **networking.k8s.io/v1**
+- It is namespaced.
+- The Pod selectore defines the pods that the policy applues to.
+- Have the series of ingress and egress rules or both.  
+- They typicall use pod selectors to identify the other pods in cluster.
+   
+![image](https://github.com/user-attachments/assets/3329f3e4-0889-424b-9f27-c6d5962738b5)
+
+## Calico Network Policy
+
+- Calico support 2 types of  Network policies:
+  1. Networkpolicy  
+     - The API group belongs to the **projectcalico.org/v3**
+     - It is Namespaced.
+     - Use label sector to define to which pods the policies are applied to.
+     - With series of Ingress/Egress rules.
+     - The implicit action is to ALLOW in Caclico Network policy, as compared to K8s network policy where its to deny.
+     - Calico allows you to Explicitly specify ALLOW or DENY actions.
+     - Calico also allows you to specify precedence order for the policy. This is important when multiple policies are applied to the same pod, and one of them says allow and other say deny.
+     - The Order field determines which policy will actually take action.
+     - Additional options to match pods based on the service account.
+     - K8s Network policies can only select pods , whereas the Calico network policy rules can identify other types of objects including Calico Network sets and Host Endpoints.
+
+![image](https://github.com/user-attachments/assets/ce5d052f-f463-4c13-a45d-a260af8bdc15)
+ 
+ 2. GlobalNetworkPolicy 
+     - The API group belongs to the **projectcalico.org/v3**
+     - It is NON-Namespaced- Global Network policy that applies across the whole cluster.
+     - Use label sector to define to which pods the policies are applied to.
+     - With series of Ingress/Egress rules.
+     - The implicit action is to ALLOW in Calico Network policy, as compared to K8s network policy where its to deny.
+     - Calico allows you to Explicitly specify ALLOW or DENY actions.
+     - Calico also allows you to specify precedence order for the policy. This is important when multiple policies are applied to the same pod, and one of them says allow and other say deny.
+     - The Order field determines which policy will actually take action.
+     - Additional options to match pods based on the serviceaccount.
+     - K8s Network policies can only select pods , whereas the Calico network policy rules can identify other types of objects including Calico Network sets and Host Endpoints.
+
+![image](https://github.com/user-attachments/assets/b47fac7b-4036-440f-8106-31b9e7c1e067)
+
+### Calico objects:
+
+     ![image](https://github.com/user-attachments/assets/6dce2d7a-bd0f-4b24-bedd-538c06a23330)
 
 
+## Calico Network Policy    Vs     Kubernetes Network Policy
+
+- Calico implements every K8s Network Policy features, with many other implementations and gap within the K8s N/W-Policy which results in policies not behaving as expected in production environments.
+- Calico is used as an reference implementation during the development of the K8s N/W-Policy API.
+- Calico provides its own network policy capabilities with a richer set of features that enable more advanced use cases.
+  
+  ![image](https://github.com/user-attachments/assets/6a979c5d-ff06-48fc-b6b3-e1edd45fae2e)
 
 
+- It is possible to use K8s and Calico Network policies side by side. 
+For example:
+  - Your developement team might use K8s Network policies to define per micro service policy rules. This is the base usecase the K8s Network policies is designed for.
+  - The Security or Platform team may use Calico network policies, to define the cluster's overall security posture. 
+        Such as: 
+          - Denying any traffic which is not specifically allowed by a network policy,
+          - Limiting egress from the cluster.
+          - Ensuring metrics can always be gathered.
 
+       ![image](https://github.com/user-attachments/assets/e52fea48-455b-4226-8886-013d17124fe5)
+
+## Host Endpoints
+
+**Ability to Protect Hosts**   
+
+- Network Policy can be thought of providing a firewall infront of every pods that is built into the pod network.
+- Calico can take that a sted further and use network policy to help secure the nodes themselves.
+- Similar to putting a firewall on every one the node's network interfaces.
+- Calico refers to this end points as Host Endpoints.
+- Endpoints can be labeled just like pods, and network policy applies to them based on their labels.      
+
+![image](https://github.com/user-attachments/assets/899c5a19-fcb6-46e2-8b41-6d4930b9ddd3)
+
+
+## ISTIO Integration
+
+- Calico can enforce network policy within an ISTIO service mesh.
+- This includes matching on application layer attributes, such as http methods and paths.
+- It uses cryptographic identity associated with each part in the service mesh as additional authentication for any traffic.
+- Enforcing policy at the service mesh layer and the pod network layer provides defence in depth, as part of a zero trust network security model.
+
+![image](https://github.com/user-attachments/assets/186b9491-4f25-4a26-8882-60ca125d4af1)
 
 
 ----------------------------------------------------------------------
