@@ -152,6 +152,80 @@ If the pod network is an Overlay network, when a pod tries to connect to an exte
    
 ![image](https://github.com/user-attachments/assets/3329f3e4-0889-424b-9f27-c6d5962738b5)
 
+### Common Network policy rules:
+1. Default deny all ingress traffic 
+
+```
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+```
+
+2. Allow all ingress traffic 
+```
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-all-ingress
+spec:
+  podSelector: {}
+  ingress:
+  - {}
+  policyTypes:
+  - Ingress
+```
+
+3. Default deny all egress traffic 
+```
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+```
+
+4. Allow all egress traffic 
+```
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-all-egress
+spec:
+  podSelector: {}
+  egress:
+  - {}
+  policyTypes:
+  - Egress
+```
+
+5. Default deny all ingress and all egress traffic 
+```
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+```
+
+Referende link [Network Policies](https://kubernetes.io/docs/concepts/services-networking/network-policies/)
+
 ## Calico Network Policy
 
 - Calico support 2 types of  Network policies:
@@ -185,7 +259,7 @@ If the pod network is an Overlay network, when a pod tries to connect to an exte
 
 ### Calico objects:
 
-     ![image](https://github.com/user-attachments/assets/6dce2d7a-bd0f-4b24-bedd-538c06a23330)
+   ![image](https://github.com/user-attachments/assets/6dce2d7a-bd0f-4b24-bedd-538c06a23330)
 
 
 ## Calico Network Policy    Vs     Kubernetes Network Policy
@@ -229,6 +303,126 @@ For example:
 - Enforcing policy at the service mesh layer and the pod network layer provides defence in depth, as part of a zero trust network security model.
 
 ![image](https://github.com/user-attachments/assets/186b9491-4f25-4a26-8882-60ca125d4af1)
+
+### Extendable with Calico Enterprise
+
+Offer additional features like: 
+- Heirarchical  policy.
+- DNS based policy.
+- Policy recommendation tools.
+- Policy impact previews.
+- Staging of policies,
+- Visbility and alerting tools.
+- Multicluster management features.
+- Compliance, Threat defence.
+
+
+## Best practices for Network Policies
+
+- Restric tingress traffic.
+- If an attacker manages to pass through ingress, to reduce further attack on other pods, restrict egress traffic.
+- Always specify the ingress and egress rules in your network policy.
+- Ensure every pods are covered by network policies.
+
+### Policy and Label Schemas
+- Standardise the way you label the pods and network policies.
+- This makes easy to follow and understand.
+- Use consistent scheme or design pattern.
+
+![image](https://github.com/user-attachments/assets/d79cb191-deac-4b6b-b006-45f16d0f3864)
+
+### Default deny
+- K8s allow all traffic to the pod by default. This is risky from security pont of view.
+- To avoid this put default deny policy that prevents any traffic which is not explicitly allowed by any other policy.
+- This can be applied per namespace basis using K8s network policy.
+
+![image](https://github.com/user-attachments/assets/3236e8c3-d1d5-49c6-bc83-2126fdcf3227)
+
+- To avoid writing policy per namespace, you can use Calico Global Network policy that applies across the whole of the cluster.
+- Caution- The above policy would also apply to any host endpoints, as well the K8s and Calico Control Planes.
+
+![image](https://github.com/user-attachments/assets/14fd00ea-d0c7-4542-984c-588133183eba)
+
+- To avoid this, apply the policy only to the Non-system [exclude K8s and Calico controleplane {"kube-system", "calico-system", "calico-apiserver"}] pods, using namespaceSelecor as shown below:
+  
+![image](https://github.com/user-attachments/assets/2630c08b-3271-4845-b2e4-a714a5c99448)
+
+
+### Hierarchical Network Policy
+
+- Split the security responsibilities across multple layers of teams.
+- Similar to teams delegating trust to each other, within specific scopes they have defined.
+- In the below example, the infosec team defines the guardrails for the platform team.
+- And the platform team defines the gaurdrails for the individual service teams.
+
+![image](https://github.com/user-attachments/assets/80f2b5cf-064f-4934-9be5-b7e0cbe84403)
+
+# Scenarios
+
+1. To simulate a compromise of the customer pod we will exec into the pod and attempt to access the database directly from there.
+
+   ```
+   kubectl exec -it $CUSTOMER_POD -n yaobank -c customer -- /bin/bash
+   ```
+
+From within the customer pod, we will now attempt to access the database directly, simulating an attack.  As the pod is not secured with NetworkPolicy, the attack will succeed and the balance of all users will be returned.
+
+```
+curl http://database:2379/v2/keys?recursive=true | python -m json.tool
+Success!!
+```
+
+To protect the database, we will be using kubernetes policy.
+
+```
+cat <<EOF | kubectl apply -f -
+---
+kind: NetworkPolicy
+apiVersion: networking.k8s.io/v1
+metadata:
+  name: database-policy
+  namespace: yaobank
+spec:
+  podSelector:
+    matchLabels:
+      app: database
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: summary
+    ports:
+      - protocol: TCP
+        port: 2379
+  egress:
+    - to: []
+EOF
+```
+```
+curl --connect-timeout 3 http://database:2379/v2/keys?recursive=true
+Timeout!!
+```
+
+The above scenarios results in applying the Network policy to all the namespaces. Here is why Calico policy can be useful. Since Calico’s GlobalNetworkPolicy policies apply across all namespaces, you can write a single default-deny policy for the whole of your cluster. Like:
+
+```
+cat <<EOF | calicoctl apply -f -
+apiVersion: projectcalico.org/v3
+kind: GlobalNetworkPolicy
+metadata:
+  name: default-app-policy
+spec:
+  namespaceSelector: has(projectcalico.org/name) && projectcalico.org/name not in {"kube-system", "calico-system", "calico-apiserver"}
+  types:
+  - Ingress
+  - Egress
+EOF
+```
+NOTE: The calicoctl utility is used to create and manage Calico resource types, as well as allowing you to run a range of other Calico specific commands. In this specific case, we are creating a GlobalNetworkPolicy (GNP).
+
+
+
+
 
 
 ----------------------------------------------------------------------
