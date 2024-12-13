@@ -359,6 +359,11 @@ Offer additional features like:
 
 # Scenarios
 
+Assumes you already have the "Yet Another Online Bank" (yaobank) installed. Below is the architecture of YAOBank:
+
+![image](https://github.com/user-attachments/assets/cd8b992f-a9cc-4e4f-8dfd-4c77a54b763f)
+
+
 1. To simulate a compromise of the customer pod we will exec into the pod and attempt to access the database directly from there.
 
    ```
@@ -420,10 +425,239 @@ EOF
 ```
 NOTE: The calicoctl utility is used to create and manage Calico resource types, as well as allowing you to run a range of other Calico specific commands. In this specific case, we are creating a GlobalNetworkPolicy (GNP).
 
+2. Lets update our default policy to allow DNS to the cluster-internal kube-dns service. 
+```
+cat <<EOF | calicoctl apply -f -
+apiVersion: projectcalico.org/v3
+kind: GlobalNetworkPolicy
+metadata:
+  name: default-app-policy
+spec:
+  namespaceSelector: has(projectcalico.org/name) && projectcalico.org/name not in {"kube-system", "calico-system"}
+  types:
+  - Ingress
+  - Egress
+  egress:
+    - action: Allow
+      protocol: UDP
+      destination:
+        selector: k8s-app == "kube-dns"
+        ports:
+          - 53
+EOF
+```
 
+3. Define policies for the customer or summary pods to access the setup.
+```
+cat <<EOF | kubectl apply -f - 
+---
+kind: NetworkPolicy
+apiVersion: networking.k8s.io/v1
+metadata:
+  name: customer-policy
+  namespace: yaobank
+spec:
+  podSelector:
+    matchLabels:
+      app: customer
+  ingress:
+    - ports:
+      - protocol: TCP
+        port: 80
+  egress:
+    - to: []
+---
+kind: NetworkPolicy
+apiVersion: networking.k8s.io/v1
+metadata:
+  name: summary-policy
+  namespace: yaobank
+spec:
+  podSelector:
+    matchLabels:
+      app: summary
+  ingress:
+    - from:
+      - podSelector:
+          matchLabels:
+            app: customer
+      ports:
+      - protocol: TCP
+        port: 80
+  egress:
+    - to:
+      - podSelector:
+          matchLabels:
+            app: database
+      ports:
+      - protocol: TCP
+        port: 2379
+EOF
+```
 
+4.  Create a Calico GlobalNetworkPolicy to restrict egress to the Internet to only pods that have a ServiceAccount that is labeled "internet-egress = allowed".
+```
+cat <<EOF | calicoctl apply -f -
+apiVersion: projectcalico.org/v3
+kind: GlobalNetworkPolicy
+metadata:
+  name: egress-lockdown
+spec:
+  order: 600
+  namespaceSelector: has(projectcalico.org/name) && projectcalico.org/name not in {"kube-system", "calico-system"}
+  serviceAccountSelector: internet-egress not in {"allowed"}
+  types:
+  - Egress
+  egress:
+    - action: Deny
+      destination:
+        notNets:
+          - 10.0.0.0/8
+          - 172.16.0.0/12
+          - 192.168.0.0/16
+          - 198.18.0.0/15
+EOF
+```
 
+Examine the policy above. While Kubernetes network policies only have Allow rules, Calico network policies also support Deny rules. As this policy has Deny rules in it, it is important that we set its precedence higher than the lazy developer's Allow rules in their Kubernetes policy. To do this we specify order value of 600 in this policy, which gives this higher precedence than Kubernetes Network Policy (which does not have the concept of setting policy precedence, and is assigned a fixed order value of 1000 by Calico - i.e, policy order 600 gets precedence over policy order 1000).
 
+5. Grant Selective Cluster Egress
+
+Now imagine there was a legitimate reason to allow connections from the customer pod to the internet. As we used a Service Account label selector in our egress policy rules, we can enable this by adding the appropriate label to the pod's Service Account.
+
+```
+kubectl label serviceaccount -n yaobank customer internet-egress=allowed
+```
+
+## Protecting Hosts
+
+- The interfaces on the node are reprensted in the Calico resource model as Host Endpoints.
+- In the below example, the host endopint applies to the node's interface to the underlying network eth0:
+- The Network policies matches using the labels, and without needing any special host specific syntax within the network policy.
+
+![image](https://github.com/user-attachments/assets/56b7d19b-826c-4fdc-9164-a4fbbc15770e)
+
+- For all network interfaces, you can use wilcard *
+
+![image](https://github.com/user-attachments/assets/765cbd4c-70d0-4430-bc14-ac772f18e0b9)
+
+- The Calico Policy can also be used to protect the host interfaces in any standalone Linux node (such as a baremetal node, cloud instance or virtual machine)
+
+- Host endpoints are non-namespaced. So in order to secure host endpoints we'll need to use Calico global network policies. whcih allows DNS but by default deny all other traffic.
+- We’ll create a default-node-policy that allows processes running in the host network namespace to connect to each other, but results in default-deny behavior for any other node connections.
+
+```
+cat <<EOF| calicoctl apply -f -
+---
+apiVersion: projectcalico.org/v3
+kind: GlobalNetworkPolicy
+metadata:
+  name: default-node-policy
+spec:
+  selector: has(kubernetes.io/hostname)
+  ingress:
+  - action: Allow
+    protocol: TCP
+    source:
+      nets:
+      - 127.0.0.1/32
+  - action: Allow
+    protocol: UDP
+    source:
+      nets:
+      - 127.0.0.1/32
+EOF
+```
+
+- Create the Host Endpoints, allowing Calico to start policy enforcement on node interfaces.
+
+```
+calicoctl patch kubecontrollersconfiguration default --patch='{"spec": {"controllers": {"node": {"hostEndpoint": {"autoCreate": "Enabled"}}}}}'
+```
+
+- Verify:
+```
+calicoctl get heps
+NAME               NODE
+node2-auto-hep     node2
+control-auto-hep   control
+node1-auto-hep     node1
+```
+
+NOTE: Calico has a configurable list of “failsafe” ports which take precedence over any policy. These failsafe ports ensure the connections required for the host networked Kubernetes and Calico control planes processes to function are always allowed (assuming your failsafe ports are correctly configured). This means you don’t have to worry about defining policy rules for these. The default failsafe ports also allow SSH traffic so you can always log into your nodes.
+
+### Lockdown Nodeport access
+
+- To restrict who can access services from outside the cluster. Lock down all node port access, and selectively allow access to the customer front end.
+- Kube-proxy load balances incoming connections to node ports to the pods backing the corresponding service. This process involves using DNAT (Destination Network Address Translation) to map the connection to the node port to a pod IP address and port.
+- Calico GlobalNetworkPolicy allows you to write policy that is enforced before this translation takes place. i.e. Policy that sees the original node port as the destination, not the backing pod that is being load balanced to as the destination. 
+
+```
+cat <<EOF | calicoctl apply -f -
+---
+apiVersion: projectcalico.org/v3
+kind: GlobalNetworkPolicy
+metadata:
+  name: nodeport-policy
+spec:
+  order: 100
+  selector: has(kubernetes.io/hostname)
+  applyOnForward: true
+  preDNAT: true
+  ingress:
+  - action: Deny
+    protocol: TCP
+    destination:
+      ports: ["30000:32767"]
+  - action: Deny
+    protocol: UDP
+    destination:
+      ports: ["30000:32767"]
+EOF
+```
+
+Verify you cannot access yaobank frontend
+```
+curl --connect-timeout 3 198.19.0.1:30180
+```
+
+Selectively allow access to customer front end- Let’s update our policy to allow only host1 to access the customer node port:
+
+```
+cat <<EOF | calicoctl apply -f -
+---
+apiVersion: projectcalico.org/v3
+kind: GlobalNetworkPolicy
+metadata:
+  name: nodeport-policy
+spec:
+  order: 100
+  selector: has(kubernetes.io/hostname)
+  applyOnForward: true
+  preDNAT: true
+  ingress:
+  - action: Allow
+    protocol: TCP
+    destination:
+      ports: [30180]
+    source:
+      nets:
+      - 198.19.15.254/32
+  - action: Deny
+    protocol: TCP
+    destination:
+      ports: ["30000:32767"]
+  - action: Deny
+    protocol: UDP
+    destination:
+      ports: ["30000:32767"]
+EOF
+```
+
+Verify access for host1
+```
+curl 198.19.0.1:30180
+```
 
 ----------------------------------------------------------------------
 
