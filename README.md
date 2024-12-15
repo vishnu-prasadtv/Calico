@@ -6,7 +6,7 @@ Core Principles
 1.  Every pod gets its own IP address.
 2.  Containers within the pod can share that IP address and communicate freely with each other.
 3.  Pods can communicate with other pods in cluster using the IP address without (NAT) Network Adress Translation. That is the IPs are preserved across the pod network.
-4.  Network Isolation that restict each pod can communicate with defines using Network Policy.
+4.  Network Isolation that restrict each pod can communicate with defines using Network Policy.
 5.  Referred as Flat Network. This simplifies the network, and allows new workloads to be scheduled dynamically anywhere in the cluster with no dependecies on the network design
 6.  Security is defined by Network Policy instead of conventional Network Topology.
 7.  The Kubernetes network model requires L3 (IP) connectivity only. Pods may be in the same CIDR, but are normally not strictly in the same subnet as they don't have L2 connectivity.
@@ -659,7 +659,300 @@ Verify access for host1
 curl 198.19.0.1:30180
 ```
 
-----------------------------------------------------------------------
+# Introduction to pod connectivity
+
+- Each node has its own IP, and is connected to the underlying network over a network interface: Eg: eth0.
+- Pods also have its own IP address.
+- The Pod's networking environment is isolated from the Host using Linux network Namespaces.
+- The pods are connected to the Host using a pair virtual ethernet interfaces - veth pair.
+- The pod see eth0 is their interface, and the host has an algorithmically generated interface name for each pod beginning with "cali".
+- Calico sets up the host networking namespace to act as a virtual router.
+- The local pods are connected to the virtual router.
+- Calico make sure the virtual router knows where the all the pods are across the rest of the cluster.
+- So calico can forward traffic to the right places.
+
+![image](https://github.com/user-attachments/assets/8a02a630-35c2-4009-a696-574e80a51f13)
+
+- The traffic between the same nodes are routed locally.
+
+![image](https://github.com/user-attachments/assets/1bad419e-354c-4b09-9193-24add7efd14b)
+
+- The traffic between pods on different nodes is routed over the underlying network.
+
+![image](https://github.com/user-attachments/assets/380eb59d-36d8-48fa-9a54-487645c01698)
+
+
+## IP-IP : VXLAN
+
+- What happens when the underlying network DOES NOT know how to forward the pod traffic?
+  -  In these cases we need to run an Overlay Network.
+ 
+- Calico supports bothe VXLAN and IP-IP overlays.
+- Implemented as Virtual Interfaces within the linux Kernel.
+
+- When a pod sends a packet to a pod on a different node, the original package is encpasulated using VXLAN or IPIP into an outer packet using the node IP addresss.
+- This hides the pod IPs of the original inner packet.
+- The underlying network then just handles this as any other node to node traffic.
+- On the receiving node, the VXLAN or IPIP packet is de-encpasulated to reveal the original packet, which is delivered to the destination pod.
+- This is all don in Lnux Kernel.
+- However, It is an overhead when you are running an Network intensive workloads.
+- To avoid above drawback Calico support cross-subnet overlay modes, where the nodes in the same subnet can send pod traffic to each other without using an overlay.
+- The overlay is only used when the pod traffic needs to flow between nodes in different subnets.
+- So we get the best possible performance for each network flow, only using the overlay for the packets that actually need it.
+- 
+
+![image](https://github.com/user-attachments/assets/88907ac4-8c97-4998-9fb6-b5b4e3169991)
+
+## Scenarios 
+
+### How Pods See the Network
+
+- Exec into pod:
+- Checkout the interfaces:
+  ```
+  # ip addr
+    1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+      link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+      inet 127.0.0.1/8 scope host lo
+         valid_lft forever preferred_lft forever
+      inet6 ::1/128 scope host
+         valid_lft forever preferred_lft forever
+    3: eth0@if9: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1410 qdisc noqueue state UP group default
+        link/ether 3a:0c:14:d0:92:89 brd ff:ff:ff:ff:ff:ff link-netnsid 0
+        inet 198.19.22.132/32 brd 198.19.22.132 scope global eth0
+           valid_lft forever preferred_lft forever
+        inet6 fe80::380c:14ff:fed0:9289/64 scope link
+           valid_lft forever preferred_lft forever
+  ```
+
+  - There is an eth0 interface which has the pods actual IP address, 198.19.22.132. Notice this matches the IP address that kubectl get pods returned earlier.
+```
+# ip -c link show up
+  1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+  3: eth0@if9: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1410 qdisc noqueue state UP mode DEFAULT group default
+      link/ether 3a:0c:14:d0:92:89 brd ff:ff:ff:ff:ff:ff link-netnsid 0
+  
+```
+- eth0 is a link to the host network namespace (indicated by link-netnsid 0). This is the pod's side of the virtual ethernet pair (veth pair) that connects the pod to the node’s host network namespace.
+
+- The @if9 at the end of the interface name (on eth0) is the interface number for the other end of the veth pair, which is located within the host's network namespace itself.  In this example, interface number 9. Remember this number for later. You might want to write it down, because we will need to know this number when we take a look at the other end of the veth pair shortly.
+
+### Routes
+```
+# ip route
+default via 169.254.1.1 dev eth0
+169.254.1.1 dev eth0  scope link 
+```
+
+This shows that the pod's default route is out over the eth0 interface. i.e. Anytime it wants to send traffic to anywhere other than itself, it will send the traffic over eth0. (Note that the next hop address of 169.254.1.1 is a dummy address used by Calico. Every Calico networked pod sees this as its next hop.)
+
+
+### How Hosts See Connections to Pods
+- SSH into the host.
+  
+Interfaces- Hosts
+```
+# ip -c link show up
+
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP mode DEFAULT group default qlen 1000
+    link/ether 00:15:5d:60:a5:a3 brd ff:ff:ff:ff:ff:ff
+5: cali1eaab2bfc77@if3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1410 qdisc noqueue state UP mode DEFAULT group default
+    link/ether ee:ee:ee:ee:ee:ee brd ff:ff:ff:ff:ff:ff link-netns cni-8174e7bb-f2a6-0b61-1282-2c425f949ab5
+6: cali9c9ee09e807@if3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1410 qdisc noqueue state UP mode DEFAULT group default
+    link/ether ee:ee:ee:ee:ee:ee brd ff:ff:ff:ff:ff:ff link-netns cni-e269d0db-f258-6f12-8f31-064bbb4cf87c
+7: calid35188eb0ba@if3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1410 qdisc noqueue state UP mode DEFAULT group default
+    link/ether ee:ee:ee:ee:ee:ee brd ff:ff:ff:ff:ff:ff link-netns cni-cebefddd-a569-08c2-29d7-7551967f7cf4
+8: calif0a98285df9@if3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1410 qdisc noqueue state UP mode DEFAULT group default
+    link/ether ee:ee:ee:ee:ee:ee brd ff:ff:ff:ff:ff:ff link-netns cni-0a89d746-b16d-2299-9e6e-948dd7b2b512
+9: caliea2aa288365@if3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1410 qdisc noqueue state UP mode DEFAULT group default
+    link/ether ee:ee:ee:ee:ee:ee brd ff:ff:ff:ff:ff:ff link-netns cni-f7159375-bf04-e8d8-85b8-0da49bfd53d0
+```
+
+Look for the interface number that we noted when looking at the interfaces inside the pod. In our example it was interface number 9.  Looking at interface 9 in the above output, we see caliea2aa288365 which links to @if3 in network namespace ID 3 (the customer pod's network namespace). You may recall that interface 9 in the pod's network namespace was eth0, so this looks exactly as expected for the veth pair that connects the customer pod to the host network namespace. The interface numbers in your environment may be different but you should be able to follow the same chain of reasoning.
+
+You can also see the host end of the veth pairs to other pods running on this node, all beginning with cali.
+
+### How Hosts Route Pod Traffic
+
+-SSH into the node1
+
+```
+# ip route
+default via 192.168.44.65 dev eth0 proto dhcp src 192.168.44.75 metric 100
+192.168.44.64/28 dev eth0 proto kernel scope link src 192.168.44.75
+192.168.44.65 dev eth0 proto dhcp scope link src 192.168.44.75 metric 100
+198.19.0.0/20 dev eth0 proto kernel scope link src 198.19.0.2
+198.19.21.0/26 via 198.19.0.1 dev eth0 proto bird
+198.19.21.64/26 via 198.19.0.3 dev eth0 proto bird
+198.19.22.128 dev cali1eaab2bfc77 scope link
+blackhole 198.19.22.128/26 proto bird
+198.19.22.129 dev cali9c9ee09e807 scope link
+198.19.22.130 dev calid35188eb0ba scope link
+198.19.22.131 dev calif0a98285df9 scope link
+198.19.22.132 dev caliea2aa288365 scope link
+```
+
+In this example output, we can see the route to the customer pod's IP (198.19.22.132) is via the caliea2aa288365 interface, the host end of the veth pair for the customer pod. You can see similar routes for each of the IPs of the other pods hosted on this node. It's these routes that tell Linux where to send traffic that is destined to a local pod on the node.
+
+We can also see several routes labeled proto bird. These are routes to pods on other nodes that Calico has learned over BGP.
+
+To understand these better, consider this route in the example output above 198.19.21.64/26 via 198.19.0.3 dev eth0 proto bird . It indicates pods with IP addresses falling within the 198.19.21.64/26 CIDR can be reached 198.19.0.3 (which is node2) through the eth0 network interface (the host's main interface to the rest of the network). You should see similar routes in your output for each node.
+
+Calico uses route aggregation to reduce the number of routes when possible. (e.g. /26 in this example). The /26 corresponds to the default block size that Calico IPAM (IP Address Management) allocates on demand as nodes need pod IP addresses. (If desired, the block size can be configured in Calico IPAM settings.)
+
+You can also see the blackhole 198.19.22.128/26 proto bird route. The 198.19.22.128/26 corresponds to the block of IPs that Calico IPAM allocated on demand for this node. This is the block from which each of the local pods got their IP addresses. The blackhole route tells Linux that if it can't find a more specific route for an individual IP in that block then it should discard the packet (rather than sending it out the default route to the network). You will only see traffic that hits this rule if something is trying to send traffic to a pod IP that doesn't exist, for example sending traffic to a recently deleted pod.
+
+If Calico IPAM runs out of blocks to allocate to nodes, then it will use unused IPs from other nodes' blocks. These will be announced over BGP as more specific routes, so traffic to pods will always find its way to the right host.
+
+
+## Introduction to Encryption
+
+### Wireguard
+
+- Used to secure data in transit using state-of-the-art encryption with Wireguard.
+- Wireguesrd is another kind of Overlay network option, But with added benefit of encryption.
+- Calico uses a virtual interface for the Wireguard traffic.
+- This encrypts on the sending node, Sends the encrypted data over the network to the other node, where the Wireguard interface decrypts the packet, so it can be forwarded on to the destination pod.
+- Calico automates all the configuration and provisioning of Wiregurad for you.
+- You can turn on and off with a single configuration setting.
+
+![image](https://github.com/user-attachments/assets/f531478a-9c24-4609-885c-6066c4d4abab)
+
+### Enabling encryption
+
+Calico handles all the configuration of WireGuard for you to provide full mesh encryption across all the nodes in your cluster.  WireGuard is included in the latest Linux kernel versions by default, and if running older Linux versions you can easily load it as a kernel module. (Note that if you have some nodes that don’t have WireGuard support, then traffic to/from those specific nodes will be unencrypted.)
+
+While WireGuard performs well, there is still an overhead associated with encryption. As-such, at the time of this writing: this is an optional feature that is not enabled by default.
+
+Let’s start by enabling encryption:
+```
+calicoctl patch felixconfiguration default --type='merge' -p '{"spec":{"wireguardEnabled":true}}'
+```
+Within a few moments WireGuard encryption will be in place on all the nodes in the cluster.
+
+### Inspecting WireGuard status
+
+Every node that is using WireGuard encryption generates its own public key. You check the node status using calicoctl. If WireGuard is active on the node you will see the public key it is using in the status section. 
+
+```
+# calicoctl get node node1 -o yaml
+
+apiVersion: projectcalico.org/v3
+kind: Node
+metadata:
+  annotations:
+    projectcalico.org/kube-labels: '{"beta.kubernetes.io/arch":"amd64","beta.kubernetes.io/instance-type":"k3s","beta.kubernetes.io/os":"linux","k3s.io/hostname":"node1","k3s.io/internal-ip":"198.19.0.2","kubernetes.io/arch":"amd64","kubernetes.io/hostname":"node1","kubernetes.io/os":"linux","node.kubernetes.io/instance-type":"k3s"}'
+  creationTimestamp: "2020-10-20T23:33:09Z"
+  labels:
+    beta.kubernetes.io/arch: amd64
+    beta.kubernetes.io/instance-type: k3s
+    beta.kubernetes.io/os: linux
+    k3s.io/hostname: node1
+    k3s.io/internal-ip: 198.19.0.2
+    kubernetes.io/arch: amd64
+    kubernetes.io/hostname: node1
+    kubernetes.io/os: linux
+    node.kubernetes.io/instance-type: k3s
+  name: node1
+  resourceVersion: "8760"
+  uid: 66f16def-8f76-46dc-90e3-491bfc75dc9b
+spec:
+  bgp:
+    ipv4Address: 198.19.0.2/20
+    ipv4IPIPTunnelAddr: 198.19.22.128
+  orchRefs:
+  - nodeName: node1
+    orchestrator: k8s
+  wireguard:
+    interfaceIPv4Address: 198.19.22.131
+status:
+  podCIDRs:
+  - 198.19.17.0/24
+  wireguardPublicKey: An4UT4PR9XzGgJ5df452Dw034q1SfXZOI1Dp2ebUUWQ=
+```
+
+Now, SSH into the node1
+```
+# ip addr | grep wireguard
+
+10: wireguard.cali: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1400 qdisc noqueue state UNKNOWN group default qlen 1000
+    inet 198.19.22.131/32 brd 198.19.22.131 scope global wireguard.cali
+```
+
+### Disabling Encryption
+
+Switching off encryption is as simple as switching it on. Let’s try that now.
+```
+# calicoctl patch felixconfiguration default --type='merge' -p '{"spec":{"wireguardEnabled":false}}'
+```
+
+Within a few moments encryption will be disabled. This can be validated by looking at the node once again and seeing that the wireguard public key has been removed from the specification. 
+
+```
+# calicoctl get node node1 -o yaml
+
+apiVersion: projectcalico.org/v3
+kind: Node
+metadata:
+  annotations:
+    projectcalico.org/kube-labels: '{"beta.kubernetes.io/arch":"amd64","beta.kubernetes.io/instance-type":"k3s","beta.kubernetes.io/os":"linux","k3s.io/hostname":"node1","k3s.io/internal-ip":"198.19.0.2","kubernetes.io/arch":"amd64","kubernetes.io/hostname":"node1","kubernetes.io/os":"linux","node.kubernetes.io/instance-type":"k3s"}'
+  creationTimestamp: "2020-10-20T23:33:09Z"
+  labels:
+    beta.kubernetes.io/arch: amd64
+    beta.kubernetes.io/instance-type: k3s
+    beta.kubernetes.io/os: linux
+    k3s.io/hostname: node1
+    k3s.io/internal-ip: 198.19.0.2
+    kubernetes.io/arch: amd64
+    kubernetes.io/hostname: node1
+    kubernetes.io/os: linux
+    node.kubernetes.io/instance-type: k3s
+  name: node1
+  resourceVersion: "9067"
+  uid: 66f16def-8f76-46dc-90e3-491bfc75dc9b
+spec:
+  bgp:
+    ipv4Address: 198.19.0.2/20
+    ipv4IPIPTunnelAddr: 198.19.22.128
+  orchRefs:
+  - nodeName: node1
+    orchestrator: k8s
+status:
+  podCIDRs:
+  - 198.19.17.0/24
+```
+
+## Introduction to IP Pools
+
+IP Pools are Calico resources which define ranges of addresses that the calico IP address management and IPAM CNI Plugin can use.
+THe Range IP addresses are decided by CIDR notations.
+
+- To improve performance and scalability, Calico's IP address management alloactes IPs to nodes in-blocks.
+- Blocks are allocated Dynamically to nodes as required.
+- If a nodes uses up all the IPs from within the blocks it's been allocated, then additional blocks will be automatically allocated to it.
+- The block size parameter is the CIDR network mask length of the blocks.
+- By default its 26, which meas a block of 64 IPs.
+- Depending on how the cluster is configured, If there's no remaining unallocated IP blocks, then a node can borrow individual unused IPs from another node's block.
+- IP Pools are also used to specify the IP address range specific networking behaviors. For example- Whether to use an overlay mode for pods allocated IPs from the pool, Or whether to NAT outgoing connections from the cluster, mapping pod IPs to their correcpsonding node IP, which is required whenever your pod IPs are not routable outside of the pod network.
+
+    - For example, If the pod network is an overlay network. You can also mark a pool as disabled if you dont want it to be used for IP address management.
+ 
+- You can specify a node selector that limits which nodes the IP address management can we used on, which allows you to limit specific nodes to using specific ranges of IP addresses for their pod.
+
+- In addition to node selectirs for IP Pools, calico also supports annotations on namespaces, Or individual pods, as another way of controlling which IP pool a pod will get its address from.
+
+- You can also control which IP pools are used on per node basis using CNI configuration files, though with all the other opstions its rare to do so.
+
+  ![image](https://github.com/user-attachments/assets/e8fc4622-22f4-4558-b9e5-fa6daa0b887e)
+
+## BGP Peering
+
+
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 
 
