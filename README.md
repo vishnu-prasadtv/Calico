@@ -950,7 +950,890 @@ THe Range IP addresses are decided by CIDR notations.
 
 ## BGP Peering
 
+- BGP is a standards-based network protocol.
+- Its supported by most of the routers. Used to power much of the internet.
+- Its used to share and synchronize routing information between routers.
+- Using BGP, Calico can share routes with other BGP capable routers in the underlying network.
+- Typically used in an On-prem, or Private cloud network, rather than Public cloud network.
+- Since each node is able to share its local routes to the underlying network, si pods become first-class citizens on the network, and the need of overlay is avoided.
+- In large clusters, sharing individual routes to every single pod in the cluster with the underlying network can put a strain on the underlying routers.
 
+  ![image](https://github.com/user-attachments/assets/5fb9b818-2cb7-41d8-94ea-a945fa6b18e9)
+
+- To avoid the above mentioned strain, Calico performs route aggregation based on the IP pool block sizes.
+- Each IP block results in one route, rather than there being individual routes for every pod within the block.
+- This reduces the number of routes to a trivial load, for almost any network even with the largest of clusters.
+- If desired each router on the underlying network can share the routes it learned from the rest of the network back to the node.
+
+![image](https://github.com/user-attachments/assets/1b5cee76-87e0-4f64-a18f-be132bc57984)
+
+### Scenario
+
+There are two address ranges that Kubernetes is normally configured with that are worth understanding:
+- The cluster pod CIDR is the range of IP addresses Kubernetes is expecting to be assigned to pods in the cluster.
+- The services CIDR is the range of IP addresses that are used for the Cluster IPs of Kubernetes Sevices (the virtual IP that corresponds to each Kubernetes Service).
+
+This can be checked using:
+
+```
+# kubectl cluster-info dump | grep -m 2 -E "service-cidr|cluster-cidr"
+
+"k3s.io/node-args": "[\"server\",\"--flannel-backend\",\"none\",\"--cluster-cidr\",\"198.19.16.0/20\",\"--service-cidr\",\"198.19.32.0/20\",\"--write-kubeconfig-mode\",\"664\",\"--disable-network-policy\"]",
+```
+The IP Pools that Calico has been configured with, which offer finer grained control of IP address ranges to be used by pods in the cluster.
+```
+# calicoctl get ippools
+
+NAME                  CIDR             SELECTOR
+default-ipv4-ippool   198.19.16.0/21   all()
+```
+
+In this cluster Calico has been configured to allocate IP addresses for pods from the 198.19.16.0/21 CIDR (which is a subset of the cluster pod CIDR, 198.19.16.0/20, configured on Kubernetes).
+
+Overall we have the following address ranges:
+```
+198.19.16.0/20 - Cluster Pod CIDR
+198.19.16.0/21- Default IP Pool CIDR
+198.19.32.0/20 - Service CIDR
+```
+Note that these IP address ranges are CIDRs, not subnets. This distinction is a little subtle, but in a strict networking sense subnet implies L2 connectivity within the subnet, but the Kubernetes networking model is oriented around L3 connectivity.
+
+
+ ### Use case
+One use of Calico IP Pools is to distinguish between different ranges of addresses with different routability scopes
+
+You are operating at very large scales then IP addresses are precious. You might want to have a range of IPs that is only routable within the cluster, and another range of IPs that is routable across the whole of your enterprise. Then you could choose which pods should get IPs from which range depending on whether workloads from outside of the cluster need to directly access the pods or not.
+
+### Create externally routable IP Pool
+
+Create a new pool for 198.19.24.0/21 that we want to be externally routable.
+```
+cat <<EOF | calicoctl apply -f - 
+---
+apiVersion: projectcalico.org/v3
+kind: IPPool
+metadata:
+  name: external-pool
+spec:
+  cidr: 198.19.24.0/21            <--------- New CIDR
+  blockSize: 29
+  ipipMode: Never
+  natOutgoing: true
+  nodeSelector: "!all()"
+EOF
+```
+
+Check new IP Pools:
+```
+# calicoctl get ippools
+Successfully applied 1 'IPPool' resource(s)
+NAME                  CIDR             SELECTOR
+default-ipv4-ippool   198.19.16.0/21   all()
+external-pool         198.19.24.0/21   !all()         <--------- New 
+```
+
+Current ranges:
+```
+198.19.16.0/20 - Cluster Pod CIDR
+198.19.16.0/21 - Default IP Pool CIDR
+198.19.24.0/21 - External Pool CIDR        <--------- New
+198.19.32.0/20 - Service CIDR
+```
+
+### Examine BGP peering status
+
+- Switch to node1:
+- Check the status of Calico on the node:
+
+```
+# sudo calicoctl node status
+
+Calico process is running.
+IPv4 BGP status
++--------------+-------------------+-------+----------+-------------+
+| PEER ADDRESS |     PEER TYPE     | STATE |  SINCE   |    INFO     |
++--------------+-------------------+-------+----------+-------------+
+| 198.19.0.1   | node-to-node mesh | up    | 04:04:44 | Established |
+| 198.19.0.3   | node-to-node mesh | up    | 04:04:48 | Established |
++--------------+-------------------+-------+----------+-------------+
+
+IPv6 BGP status
+No IPv6 peers found.
+```
+- This shows that currently this node is only peering with the other nodes in the cluster and is not peering to any networks outside of the cluster.
+
+- Calico adds routes on each node to the local pods on that node. Note that BGP is not involved in programming the routes to the local pods on the node. Each node only uses BGP to share these local routes with the rest of the network, and to learn routes from the rest of the network which it then adds to the node.
+
+### Add a BGP Peer
+
+```
+cat <<EOF | calicoctl apply -f -
+---
+apiVersion: projectcalico.org/v3
+kind: BGPPeer
+metadata:
+  name: bgppeer-global-host1
+spec:
+  peerIP: 198.19.15.254
+  asNumber: 64512
+EOF
+```
+
+### Examine the new BGP peering status
+
+- Switch to node1 again:
+
+```
+# sudo calicoctl node status
+
+Calico process is running.
+
+IPv4 BGP status
++---------------+-------------------+-------+----------+-------------+
+| PEER ADDRESS  |     PEER TYPE     | STATE |  SINCE   |    INFO     |
++---------------+-------------------+-------+----------+-------------+
+| 198.19.0.1    | node-to-node mesh | up    | 04:04:45 | Established |
+| 198.19.0.3    | node-to-node mesh | up    | 04:04:49 | Established |
+| 198.19.15.254 | global            | up    | 04:09:36 | Established |
++---------------+-------------------+-------+----------+-------------+
+
+IPv6 BGP status
+No IPv6 peers found.
+```
+The output shows that Calico is now peered with host1 (198.19.15.254). This means Calico can share routes to and learn routes from host1. (Remember we are using host1 to represent a router in this lab.)
+
+In a real-world on-prem deployment you would typically configure Calico nodes within a rack to peer with the ToRs (Top of Rack) routers, and the ToRs are then connected to the rest of the enterprise or data center network. In this way pods, if desired, can be addressed from anywhere on your network. You could even go as far as giving some pods public IP addresses and have them addressable from the internet if you wanted to.
+
+
+### Configure a Namespace to use External Routable IP Addresses
+
+Calico supports annotations on both namespaces and pods that can be used to control which IP Pool (or even which IP address) a pod will receive when it is created. In this example we're going to create a namespace to host out an externally routable network.
+
+- Notice the annotation that will determine which IP Pool pods in the namespace will use.
+- Apply the namespace:
+
+```
+cat <<EOF| kubectl apply -f - 
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  annotations:
+    cni.projectcalico.org/ipv4pools: '["external-pool"]'
+  name: external-ns
+EOF
+
+namespace/external-ns created
+```
+
+Deploy an NGINX pod
+
+```
+# kubectl apply -f https://raw.githubusercontent.com/tigera/ccol1/main/nginx.yaml
+
+deployment.apps/nginx created
+networkpolicy.networking.k8s.io/nginx created
+```
+
+Access the NGINX pod from outside the cluster
+
+```
+# curl 198.19.28.208
+
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+    body {
+        width: 35em;
+        margin: 0 auto;
+        font-family: Tahoma, Verdana, Arial, sans-serif;
+    }
+</style>
+</head>
+<body>
+...
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+```
+This confirms that the NGINX pod is directly routable on the broader network. (In this simplified lab this means host1, but in a real environment this could be across the whole of the enterprise network if desired.)
+
+### Check Calico IPAM allocations statistics
+
+Take a quick look at the IP allocation stats from Calico-IPAM, by running the following command:
+```
+# calicoctl ipam show
+
++----------+----------------+-----------+------------+-------------+
+| GROUPING |      CIDR      | IPS TOTAL | IPS IN USE |  IPS FREE   |
++----------+----------------+-----------+------------+-------------+
+| IP Pool  | 198.19.16.0/21 |      2048 | 18 (1%)    | 2030 (99%)  |
+| IP Pool  | 198.19.24.0/21 |      2048 | 1 (0%)     | 2047 (100%) |
++----------+----------------+-----------+------------+-------------+
+```
+
+It can be a good idea to periodically check IP allocations statistics to check you have sized your IP pools appropriately, for example if you aren’t confident about the number of pods and whether your original sizing of the pools.
+
+
+## K8s Service Networking
+
+### Cluster IP Service
+
+- When a pod tried to connect to a Cluster IP, the connection is intercepted by rules kube-proxy has programmed into the kernel.
+- These rules select a random backing pod to load balance to, changing the destination IP to be the IP of the chosen backing pod, using DNAT, mapping Destion Network Address Translation.
+- The Linux kernel tracks the state of these connections, and automatically reverse the DNAT for any return packets.
+
+![image](https://github.com/user-attachments/assets/ff13f575-2d91-47f5-a716-baf23aff4f78)
+
+
+### NodePort Service
+
+- The Kube-proxy programming rules into the kernel to map connections to backing pods using NAT.
+- In NodePort service, in addition to the destination IP address being changed, the source IP is being changed from the client's Pod IP to the node's IP.
+- If kube-proxy did'nt do this, the return packets leaving the backing pod node would go directly to the client, without giving the node that did the NAT a chance to reverse the NAT. As a result, the client would drop the traffic because it would not recognize it as being part of the connection it made to the node port.
+- The exception to the above behavior is if the service is configured with "externaTrafficPolicy:local", in which case kube-proxy only load balances to backing pods on the same node, and as a result, can just do DNAT, preserving the client's source IP address.
+- This is great for improving understandability of application logs, and makes securing services that exposes externally with network policy a lot simpler.
+
+![image](https://github.com/user-attachments/assets/723a082f-8f16-48d0-ac57-51e2039c38bb)
+
+
+### LoadBalancer service
+
+- The loadbalancer is typically located at a point in the network where return traffic is gauranteed to be routed via it.
+- So this service only has to do DNAT for its loadbalancing.
+- It loadbalances the traffic across the nodes, using the corresponding node port of the service.
+- Kube-proxy then follows the same processes as it did for the standard NodePort, Nating both the source and destination IPs.
+- The return packets the follow the same path back to the client.
+- Some loadbalancers also support "externalTrafficPolicy:local"- In this case, they will only load balance to nodes hosting a backing po, and kube-proxy will only load balance to backing pods on the same node, preserving the original client source IP all the way to the backing pod.
+
+![image](https://github.com/user-attachments/assets/3f2fd743-0937-4a27-8185-2fe3cc81307d)
+
+
+# Introduction to Kube-Proxy
+
+- Kube-proxy uses IPtables and IPVS dataplanes.
+- Scales to thousands of services.
+- Or use Calico eBPF native service handling.
+- IPVS, has more performance benefits compared to kube-proxy and IPtables if you have very high numbers of services.
+- Calico EBPF dataplane which has built-in native service handling so you dont need to rum kube-proxy at all. This outperfom kube-proxy on either mode.
+
+## Kube-Proxy Cluster IP Implementation
+
+Scenario:
+
+```
+SVC
+NAME       TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)        AGE
+database   ClusterIP   198.19.33.51    <none>        2379/TCP       24m
+summary    ClusterIP   198.19.36.113   <none>        80/TCP         24m
+customer   NodePort    198.19.45.149   <none>        80:30180/TCP   24m
+
+Endpoints
+NAME       ENDPOINTS                         AGE
+database   198.19.21.69:2379                 25m
+summary    198.19.21.1:80,198.19.22.131:80   25m
+customer   198.19.22.132:80                  25m
+
+Pods
+NAME                        READY   STATUS    RESTARTS   AGE   IP              NODE      NOMINATED NODE   READINESS GATES
+database-6c5db58d95-x9s7m   1/1     Running   0          25m   198.19.21.69    node2     <none>           <none>
+summary-85c56b76d7-j2kc9    1/1     Running   0          25m   198.19.21.1     control   <none>           <none>
+summary-85c56b76d7-smjfn    1/1     Running   0          25m   198.19.22.131   node1     <none>           <none>
+customer-574bd6cc75-2blnv   1/1     Running   0          25m   198.19.22.132   node1     <none>           <none>
+```
+To explore the iptables rules kube-proxy programs into the kernel to implement Cluster IP based services, let's look at the Database service. The Summary pods use this service to connect to the Database pods. Kube-proxy uses DNAT to map the Cluster IP to the chosen backing pod.
+
+![image](https://github.com/user-attachments/assets/64fe3a33-e2ca-42ad-bee9-b43a852f97b1)
+
+```
+kubectl get endpoints -n yaobank summary
+NAME      ENDPOINTS                         AGE
+summary   198.19.21.1:80,198.19.22.131:80   27m
+```
+The summary service has two endpoints (198.19.21.1 on port 80, and 198.19.22.131 on port 80, in this example output). Starting from the KUBE-SERVICES iptables chain, we will traverse each chain until you get to the rule directing traffic to these endpoint IP addresses.
+
+To explore the iptables rules that kube-proxy has set up on the node1. SSH into node1, (It will have set up similar rules on every other node on the cluster.)
+
+To make it easier to manage large numbers of iptables rules, groups of iptables rules can be grouped together into iptables chains. Kube-proxy puts its top level rules into a KUBE-SERVICES chain.
+```
+sudo iptables -v --numeric --table nat --list KUBE-SERVICES
+
+Chain KUBE-SERVICES (2 references)
+ pkts    bytes target                        prot opt in     out     source               destination
+    0     0    KUBE-MARK-MASQ                tcp  --  *      *      !198.19.16.0/20       198.19.36.113        /* yaobank/summary:http cluster IP */ tcp dpt:80
+    2   120    KUBE-SVC-OIQIZJVJK6E34BR4     tcp  --  *      *       0.0.0.0/0            198.19.36.113        /* yaobank/summary:http cluster IP */ tcp dpt:80
+    0     0    KUBE-MARK-MASQ                udp  --  *      *      !198.19.16.0/20       198.19.32.10         /* kube-system/kube-dns:dns cluster IP */ udp dpt:53
+    2   158    KUBE-SVC-TCOU7JCQXEZGVUNU     udp  --  *      *       0.0.0.0/0            198.19.32.10         /* kube-system/kube-dns:dns cluster IP */ udp dpt:53
+    7   420    KUBE-MARK-MASQ                tcp  --  *      *      !198.19.16.0/20       198.19.32.1          /* default/kubernetes:https cluster IP */ tcp dpt:443
+    7   420    KUBE-SVC-NPX46M4PTMTKRN6Y     tcp  --  *      *       0.0.0.0/0            198.19.32.1          /* default/kubernetes:https cluster IP */ tcp dpt:443
+    0     0    KUBE-MARK-MASQ                tcp  --  *      *      !198.19.16.0/20       198.19.46.45         /* calico-system/calico-typha:calico-typha cluster IP */ tcp dpt:5473
+    0     0    KUBE-SVC-RK657RLKDNVNU64O     tcp  --  *      *       0.0.0.0/0            198.19.46.45         /* calico-system/calico-typha:calico-typha cluster IP */ tcp dpt:5473
+    0     0    KUBE-MARK-MASQ                tcp  --  *      *      !198.19.16.0/20       198.19.46.209        /* kube-system/traefik:https cluster IP */ tcp dpt:443
+    0     0    KUBE-SVC-IKNZCF5XJQBTG3KZ     tcp  --  *      *       0.0.0.0/0            198.19.46.209        /* kube-system/traefik:https cluster IP */ tcp dpt:443
+    0     0    KUBE-FW-IKNZCF5XJQBTG3KZ      tcp  --  *      *       0.0.0.0/0            198.19.0.3           /* kube-system/traefik:https loadbalancer IP */ tcp dpt:443
+    0     0    KUBE-MARK-MASQ                tcp  --  *      *      !198.19.16.0/20       198.19.33.51         /* yaobank/database:http cluster IP */ tcp dpt:2379
+    0     0    KUBE-SVC-AE2X4VPDA5SRYCA6     tcp  --  *      *       0.0.0.0/0            198.19.33.51         /* yaobank/database:http cluster IP */ tcp dpt:2379
+    0     0    KUBE-MARK-MASQ                tcp  --  *      *      !198.19.16.0/20       198.19.45.149        /* yaobank/customer:http cluster IP */ tcp dpt:80
+    0     0    KUBE-SVC-PX5FENG4GZJTCELT     tcp  --  *      *       0.0.0.0/0            198.19.45.149        /* yaobank/customer:http cluster IP */ tcp dpt:80
+    0     0    KUBE-MARK-MASQ                tcp  --  *      *      !198.19.16.0/20       198.19.32.10         /* kube-system/kube-dns:dns-tcp cluster IP */ tcp dpt:53
+    0     0    KUBE-SVC-ERIFXISQEP7F7OF4     tcp  --  *      *       0.0.0.0/0            198.19.32.10         /* kube-system/kube-dns:dns-tcp cluster IP */ tcp dpt:53
+    0     0    KUBE-MARK-MASQ                tcp  --  *      *      !198.19.16.0/20       198.19.32.10         /* kube-system/kube-dns:metrics cluster IP */ tcp dpt:9153
+    0     0    KUBE-SVC-JD5MR3NA4I4DYORP     tcp  --  *      *       0.0.0.0/0            198.19.32.10         /* kube-system/kube-dns:metrics cluster IP */ tcp dpt:9153
+    0     0    KUBE-MARK-MASQ                tcp  --  *      *      !198.19.16.0/20       198.19.38.163        /* kube-system/metrics-server: cluster IP */ tcp dpt:443
+    0     0    KUBE-SVC-LC5QY66VUV2HJ6WZ     tcp  --  *      *       0.0.0.0/0            198.19.38.163        /* kube-system/metrics-server: cluster IP */ tcp dpt:443
+    0     0    KUBE-MARK-MASQ                tcp  --  *      *      !198.19.16.0/20       198.19.38.41         /* kube-system/traefik-prometheus:metrics cluster IP */ tcp dpt:9100
+    0     0    KUBE-SVC-W3ST5H65YH2QID6S     tcp  --  *      *       0.0.0.0/0            198.19.38.41         /* kube-system/traefik-prometheus:metrics cluster IP */ tcp dpt:9100
+    0     0    KUBE-MARK-MASQ                tcp  --  *      *      !198.19.16.0/20       198.19.46.209        /* kube-system/traefik:http cluster IP */ tcp dpt:80
+    0     0    KUBE-SVC-X3WUOHPTYIG7AA3Q     tcp  --  *      *       0.0.0.0/0            198.19.46.209        /* kube-system/traefik:http cluster IP */ tcp dpt:80
+    0     0    KUBE-FW-X3WUOHPTYIG7AA3Q      tcp  --  *      *       0.0.0.0/0            198.19.0.3           /* kube-system/traefik:http loadbalancer IP */ tcp dpt:80
+  931 55938    KUBE-NODEPORTS                all  --  *      *       0.0.0.0/0            0.0.0.0/0            /* kubernetes service nodeports; NOTE: this must be the last rule in this chain */ ADDRTYPE match dst-type LOCAL
+```
+
+Each iptables chain consists of a list of rules that are executed in order until a rule matches. The key columns/elements to note in this output are:
+
+target - which chain iptables will jump to if the rule matches
+prot - the protocol match criteria
+source, and destination - the source and destination IP address match criteria
+the comments that kube-proxy includes
+the additional match criteria at the end of each rule - e.g dpt:80 that specifies the destination port match
+You can see this chain includes rules to jump to service specific chains, one for each service.
+
+
+### KUBE-SERVICES -> KUBE-SVC-XXXXXXXXXXXXXXXX
+
+The rules for the summary service.
+```
+sudo iptables -v --numeric --table nat --list KUBE-SERVICES | grep -E summary
+
+ 0     0 KUBE-MARK-MASQ             tcp  --  *      *      !198.19.16.0/20       198.19.36.113        /* yaobank/summary:http cluster IP */ tcp dpt:80
+ 2   120 KUBE-SVC-OIQIZJVJK6E34BR4  tcp  --  *      *       0.0.0.0/0            198.19.36.113        /* yaobank/summary:http cluster IP */ tcp dpt:80
+
+```
+The second rule directs traffic destined for the summary service clusterIP (198.19.36.113 in the example output) to the chain that load balances the service (KUBE-SVC-XXXXXXXXXXXXXXXX).
+
+
+### KUBE-SVC-XXXXXXXXXXXXXXXX -> KUBE-SEP-XXXXXXXXXXXXXXXX
+
+kube-proxy in iptables mode uses a randomized equal cost selection algorithm to load balance traffic between pods. We currently have two summary pods, so it should have rules in place that load balance equally across both pods.
+
+Let's examine how this load balancing works using the chain name returned from our previous command. (Remember your chain name may be different than this example.)
+
+```
+sudo iptables -v --numeric --table nat --list KUBE-SVC-OIQIZJVJK6E34BR4
+
+Chain KUBE-SVC-OIQIZJVJK6E34BR4 (1 references)
+ pkts   bytes    target                     prot opt in     out     source               destination
+    2   120      KUBE-SEP-Q6MJJR7VDMWJNZBE  all  --  *      *       0.0.0.0/0            0.0.0.0/0            /* yaobank/summary:http */ statistic mode random probability 0.50000000000
+    0     0      KUBE-SEP-MR2OHPODPKVEKHD4  all  --  *      *       0.0.0.0/0            0.0.0.0/0            /* yaobank/summary:http */
+```
+
+Notice that kube-proxy is using the iptables statistic module to set the probability for a packet to be randomly matched.
+
+The first rule directs traffic destined for the summary service to a chain that delivers packets to the first service endpoint (KUBE-SEP-Q6MJJR7VDMWJNZBE) with a probability of 0.50000000000. The second rule unconditionally directs to the second service endpoint chain (KUBE-SEP-MR2OHPODPKVEKHD4). The result is that traffic is load balanced across the service endpoints equally (on average).
+
+If there were 3 service endpoints then the first chain matches would be probability 0.33333333, the second probability 0.5, and the last unconditional. The result of this is that each service endpoint receives a third of the traffic (on average).
+
+And so on for any number of services!
+
+### KUBE-SEP-XXXXXXXXXXXXXXXX -> summary pod
+
+```
+sudo iptables -v --numeric --table nat --list KUBE-SEP-MR2OHPODPKVEKHD4
+
+Chain KUBE-SEP-MR2OHPODPKVEKHD4 (1 references)
+ pkts bytes target           prot opt in     out     source               destination
+    0     0 KUBE-MARK-MASQ   all  --  *      *       198.19.22.131        0.0.0.0/0            /* yaobank/summary:http */
+    0     0 DNAT             tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            /* yaobank/summary:http */ tcp to:198.19.22.131:80
+```
+The second rule performs the DNAT that changes the destination IP from the service's clusterIP to the IP address of the service endpoint backing pod (198.19.22.131 in this example). After this, standard Linux routing can handle forwarding the packet like it would any other packet.
+
+
+Recap
+You've just traced the kube-proxy iptables rules used to load balance traffic to summary pods exposed as a service of type ClusterIP.
+
+In summary, for a packet being sent to a clusterIP:   -------------->>>>>>>>>>>
+1. The KUBE-SERVICES chain matches on the clusterIP and jumps to the corresponding KUBE-SVC-XXXXXXXXXXXXXXXX chain.
+2. The KUBE-SVC-XXXXXXXXXXXXXXXX chain load balances the packet to a random service endpoint KUBE-SEP-XXXXXXXXXXXXXXXX chain.
+3. The KUBE-SEP-XXXXXXXXXXXXXXXX chain DNATs the packet so it will get routed to the service endpoint (backing pod).
+
+
+
+## Kube-Proxy NodePort Implementation
+
+To explore the iptables rules kube-proxy programs into the kernel to implement Node Port based services, let's look at the Customer service. External clients use this service to connect to the Customer pods.  Kube-proxy uses NAT to map the Node Port to the chosen backing pod, and the source IP to the node IP of the ingress node, so that it can reverse the NAT for return packets.  (If it didn't change the source IP then return packets would go directly back to the client, without the node that did the NAT having a chance to reverse the NAT, and as a result the client would not recognize the packets as being part of the connection it made to the Node Port).
+
+![image](https://github.com/user-attachments/assets/c0f7374f-a92e-45a3-bcf8-1b0fcada4a14)
+
+
+Service endpoints for customer NodePort service.
+```
+EP
+# kubectl get endpoints -n yaobank customer
+NAME       ENDPOINTS          AGE
+customer   198.19.22.132:80   39m
+
+```
+The customer service has one endpoint (198.19.22.132 on port 80 in this example output). Starting from the KUBE-SERVICES iptables chain, we will traverse each chain until you get to the rule directing traffic to this endpoint IP address.
+
+###  KUBE-SERVICES -> KUBE-NODEPORTS
+
+Node1
+
+The KUBE-SERVICE chain handles the matching for service types ClusterIP and LoadBalancer. At the end of KUBE-SERVICE chain, another custom chain KUBE-NODEPORTS will handle traffic for service type NodePort.
+```
+# sudo iptables -v --numeric --table nat --list KUBE-SERVICES | grep KUBE-NODEPORTS
+
+1216 73038 KUBE-NODEPORTS  all  --  *      *       0.0.0.0/0            0.0.0.0/0            /* kubernetes service nodeports; NOTE: this must be the last rule in this chain */ ADDRTYPE match dst-type LOCAL
+```
+“match dst-type LOCAL” matches any packet with a local host IP as the destination. I.e. any address that is assigned to one of the host's interfaces.
+
+### KUBE-NODEPORTS -> KUBE-SVC-XXXXXXXXXXXXXXXX
+
+```
+# sudo iptables -v --numeric --table nat --list KUBE-NODEPORTS
+
+Chain KUBE-NODEPORTS (1 references)
+ pkts bytes target                      prot opt in     out     source               destination
+    0     0 KUBE-MARK-MASQ              tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            /* kube-system/traefik:https */ tcp dpt:31397
+    0     0 KUBE-SVC-IKNZCF5XJQBTG3KZ   tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            /* kube-system/traefik:https */ tcp dpt:31397
+    0     0 KUBE-MARK-MASQ              tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            /* yaobank/customer:http */ tcp dpt:30180
+    0     0 KUBE-SVC-PX5FENG4GZJTCELT   tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            /* yaobank/customer:http */ tcp dpt:30180
+    0     0 KUBE-MARK-MASQ              tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            /* kube-system/traefik:http */ tcp dpt:32196
+    0     0 KUBE-SVC-X3WUOHPTYIG7AA3Q   tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            /* kube-system/traefik:http */ tcp dpt:32196
+```
+
+The fourth rule directs traffic destined for the customer service to the chain that load balances the service (KUBE-SVC-PX5FENG4GZJTCELT). tcp dpt:30180 matches any packet with the destination port of tcp 30180 (the node port of the customer service).
+
+### KUBE-SVC-XXXXXXXXXXXXXXXX -> KUBE-SEP-XXXXXXXXXXXXXXXX
+```
+sudo iptables -v --numeric --table nat --list KUBE-SVC-PX5FENG4GZJTCELT
+
+Chain KUBE-SVC-PX5FENG4GZJTCELT (2 references)
+    pkts bytes target                     prot opt in     out     source               destination
+    0     0    KUBE-SEP-UBXKSM3V2OSEF4IL  all  --  *      *       0.0.0.0/0            0.0.0.0/0            /* yaobank/customer:http */
+```
+As we only have a single backing pod for the customer service, there is no load balancing to do, so there is a single rule that directs all traffic to the chain that delivers the packet to the service endpoint (KUBE-SEP-UBXKSM3V2OSEF4IL).
+
+
+### KUBE-SEP-XXXXXXXXXXXXXXXX -> customer endpoint
+```
+# sudo iptables -v --numeric --table nat --list KUBE-SEP-UBXKSM3V2OSEF4IL
+
+Chain KUBE-SEP-UBXKSM3V2OSEF4IL (1 references)
+ pkts bytes target          prot opt in     out     source               destination
+    0     0 KUBE-MARK-MASQ  all  --  *      *       198.19.22.132        0.0.0.0/0            /* yaobank/customer:http */
+    0     0 DNAT            tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            /* yaobank/customer:http */ tcp to:198.19.22.132:80
+```
+This rule delivers the packet to the customer service endpoint.
+
+The second rule performs the DNAT that changes the destination IP from the service's clusterIP to the IP address of the service endpoint backing pod (198.19.22.132 in this example). After this, standard Linux routing can handle forwarding the packet like it would any other packet.
+
+
+Recap
+You've just traced the kube-proxy iptables rules used to load balance traffic to customer pods exposed as a service of type NodePort.
+
+In summary, for a packet being sent to a NodePort:
+
+The end of the KUBE-SERVICES chain jumps to the KUBE-NODEPORTS chain
+
+1. The KUBE-NODEPORTS chain matches on the NodePort and jumps to the corresponding KUBE-SVC-XXXXXXXXXXXXXXXX chain.
+2. The KUBE-SVC-XXXXXXXXXXXXXXXX chain load balances the packet to a random service endpoint KUBE-SEP-XXXXXXXXXXXXXXXX chain.
+3. The KUBE-SEP-XXXXXXXXXXXXXXXX chain DNATs the packet so it will get routed to the service endpoint (backing pod).
+
+## Calico Native Service Handling
+
+- As an alternative to using kube-proxy, Calico's eBPF data plane supports native service handling.
+- This presetves source IP to simplify network policy, and offers DSR (Direct Server Return) to reduce the number of network hops for return traffic.
+- It even provides loadbalancing independent of topology, with reduced CPU and latency compared to kube-proxy.
+- When an incoming connection is received from an external client, Calico's native service handling is able to load balance the connection, forwarding the packets to another node if required, without any NAT.
+- The receiving node then performs DNAT, to map the packets to the chosen backing pod.
+- Reverse packest get the DNAT reversed, and then if DSR is enabled, return directly to the client.
+
+![image](https://github.com/user-attachments/assets/d37affa0-2f37-4884-b6e9-e75403eae4ce)
+
+Calico's eBPF dataplane is an alternative to the default standard Linux dataplane (which is iptables based). The eBPF dataplane has a number of advantages:
+
+- It scales to higher throughput.
+- It uses less CPU per GBit.
+- It has native support for Kubernetes services (without needing kube-proxy) that:
+   - Reduces first packet latency for packets to services.
+   - Preserves external client source IP addresses all the way to the pod.
+   - Supports DSR (Direct Server Return) for more efficient service routing.
+   - Uses less CPU than kube-proxy to keep the dataplane in sync.
+
+The eBPF dataplane also has some limitations, which are described in the Enable the eBPF dataplane guide in the Calico documentation.
+
+### Scenarios
+
+###NodePort without source IP preservation
+
+Before we enable Calico’s eBPF based native service handling, let’s take a closer look at how kube-proxy handles node ports, and show that the client source IP is not preserved all the way to the pod backing the service. Kube-proxy uses NAT to map the destination IP to the chosen backing pod (DNAT), and map the source IP to the node IP of the ingress node (SNAT).  It does the SNAT so that standard Linux networking routes the return packets back to the ingress node so it can reverse the NAT.
+
+![image](https://github.com/user-attachments/assets/96ab5a75-553f-460d-a29d-1680eefa5d96)
+
+From host1
+
+```
+# curl 198.19.0.1:30180
+
+Logs in customer pod:
+
+198.19.0.1 - - [20/Oct/2020 23:58:06] "GET / HTTP/1.1" 200 -
+198.19.0.1 - - [21/Oct/2020 00:03:08] "GET / HTTP/1.1" 200 -
+198.19.0.1 - - [21/Oct/2020 00:11:31] "GET / HTTP/1.1" 200 -
+198.19.0.1 - - [21/Oct/2020 00:30:09] "GET / HTTP/1.1" 200 -
+```
+
+Note that the source IP that the pod sees is 198.19.0.1, which is the control node, the node we accessed the node port via. When traffic arrives from outside the cluster, kube-proxy applies SNAT to the traffic on the ingress node; from the pod's point of view, this makes the traffic appear to come from the ingress node (198.19.0.1 in this case). The SNAT is required to make sure the return traffic flows back through the same node so that NodePort DNAT can be undone.
+
+Note that if the cluster was configured to use an overlay (VXLAN or IPIP) or wireguard, then the SNAT would make the traffic appear to come from the IP address associated with the corresponding virtual interface on the ingress node.
+
+
+### Enable Calico eBPF
+
+To enable Calico eBPF we need to:
+
+- Configure Calico so it knows how to connect directly to the API server (rather than relying on kube-proxy to help it connect)
+- Disable kube-proxy
+- Configure Calico to switch to the eBPF dataplane
+
+### Configure Calico to connect directly to the API server
+
+In eBPF mode, Calico replaces kube-proxy. This means that Calico needs to be able to connect directly to the API server (just as kube-proxy would normally do). Calico supports a ConfigMap to configure these direct connections for all of its components.
+
+Note: It is important the ConfigMap points at a stable address for the API server(s) in your cluster. If you have a HA cluster, the ConfigMap should point at the load balancer in front of your API servers so that Calico will be able to connect even if one control plane node goes down. In clusters that use DNS load balancing to reach the API server (such as kops and EKS clusters) you should configure Calico to talk to the corresponding domain name.
+
+In our case, we have a single control node hosting the Kubernetes API service. So we will just configure the control node IP address directly.
+
+```
+cat <<EOF | kubectl apply -f -
+---
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: kubernetes-services-endpoint
+  namespace: tigera-operator
+data:
+  KUBERNETES_SERVICE_HOST: "198.19.0.1"
+  KUBERNETES_SERVICE_PORT: "6443"
+EOF
+
+configmap/kubernetes-services-endpoint created
+```
+
+ConfigMaps can take up to 60s to propagate; wait for 60s and then restart the operator, which itself also depends on this config:
+```
+# kubectl delete pod -n tigera-operator -l k8s-app=tigera-operator
+# watch kubectl get pods -n calico-system
+```
+
+### Disable kube-proxy
+
+Calico’s eBPF native service handling replaces kube-proxy. You can free up resources from your cluster by disabling and no longer running kube-proxy. When Calico is switched into eBPF mode it will try to clean up kube-proxy's iptables rules if they are present. 
+
+Kube-proxy normally runs as a daemonset. So an easy way to stop and remove kube-proxy from every node is to add a nodeSelector to that daemonset which excludes all nodes.
+
+In some environments, kube-proxy is installed/run via a different mechanism. For example, a k3s cluster typically doesn’t have a kube-proxy daemonset, and instead is controlled by install time k3s configuration.  In this case, you would still want to get rid of kube-proxy, but if you just wanted to try out Calico eBPF quickly on such a cluster, you can tell Calico to not try to tidy up kube-proxy’s iptables rules, and instead allow them to co-exist.  (Calico eBPF will still bypass the iptable rules, so they have no effect on the traffic.)
+
+Let’s do that now in this cluster by running this command on host1:
+```
+# calicoctl patch felixconfiguration default --patch='{"spec": {"bpfKubeProxyIptablesCleanupEnabled": false}}'
+```
+###  Switch on eBPF mode
+
+You're now ready to switch on eBPF mode. To do so, on host1, use calicoctl to enable the eBPF mode flag:
+```
+# kubectl patch installation.operator.tigera.io default --type merge -p '{"spec":{"calicoNetwork":{"linuxDataplane":"BPF", "hostPorts":null}}}'
+```
+Since enabling eBPF mode can disrupt existing connections, restart YAO Bank's customer and summary pods:
+```
+kubectl delete pod -n yaobank -l app=customer
+kubectl delete pod -n yaobank -l app=summary
+```
+
+### Source IP preservation
+Now that we've switched to the Calico eBPF data plane, Calico native service handling handles the service without needing kube-proxy. As it is handling the packets with eBPF, rather than the standard Linux networking pipeline, it is able to special case this traffic in a way that allows it to preserve the source IP address, including special handling of return traffic so it still is returned from the original ingress node.
+
+![image](https://github.com/user-attachments/assets/a4209afb-c81f-4976-9024-db5be8efefbe)
+
+So we can see the effect of source IP preservation, tail the logs of YAO Bank's customer pod again in your second shell window:
+```
+node1
+curl 198.19.0.1:30180
+
+You should see these logs from the customer pod appear:
+
+198.19.15.254 - - [05/Oct/2020 10:04:37] "GET / HTTP/1.1" 200 -
+198.19.15.254 - - [05/Oct/2020 10:04:41] "GET /logout HTTP/1.1" 404 -
+198.19.15.254 - - [05/Oct/2020 10:04:45] "GET / HTTP/1.1" 200 -
+```
+This time the source IP that the pod sees is 198.19.15.254, which is host1, which was the real source of the request, showing that the source IP has been preserved end-to-end.
+
+## Direct Server Return (DSR)
+
+Calico’s eBPF dataplane also supports DSR (Direct Server Return). DSR allows the node hosting a service backing pod to send return traffic directly to the external client rather than taking the extra hop back via the ingress node (the control node in our example). 
+
+![image](https://github.com/user-attachments/assets/7a6ca8e0-c9c3-48ad-a661-eddd733c1381)
+
+DSR requires a network fabric with suitably relaxed RPF (reverse path filtering) enforcement. In particular the network must accept packets from nodes that have a source IP of another node.  In addition, any load balancing or NAT that is done outside the cluster must be able to handle the DSR response packets from all nodes.
+
+### Snoop traffic without DSR
+
+To show the effect of this, let’s snoop the traffic on the control node.
+
+- SSH into the control node:
+- Snoop the traffic associated with the node port:
+
+```
+sudo tcpdump -nvi any 'tcp port 30180'
+tcpdump: listening on any, link-type LINUX_SLL (Linux cooked v1), capture size 262144 bytes
+```
+
+While the above command is running, access YAO Bank from your other host1 shell, using the node port via the control node:
+```
+curl 198.19.0.1:30180
+```
+
+The traffic will get logged by the tcpdump, for example:
+```
+    13:59:32.826328 IP (tos 0x0, ttl 64, id 59453, offset 0, flags [DF], proto TCP (6), length 60)
+    198.19.15.254.57064 > 198.19.0.1.30180: Flags [S], cksum 0x520e (correct), seq 2716257334, win 64240, options [mss 1460,sackOK,TS val 3319780880 ecr 0,nop,wscale 7], length 0
+13:59:32.827552 IP (tos 0x0, ttl 62, id 0, offset 0, flags [DF], proto TCP (6), length 60)
+    198.19.0.1.30180 > 198.19.15.254.57064: Flags [S.], cksum 0x287a (correct), seq 23038493, ack 2716257335, win 65184, options [mss 1370,sackOK,TS val 2052464730 ecr 3319780880,nop,wscale 7], length 0
+13:59:32.828602 IP (tos 0x0, ttl 64, id 59454, offset 0, flags [DF], proto TCP (6), length 52)
+    198.19.15.254.57064 > 198.19.0.1.30180: Flags [.], cksum 0x5394 (correct), ack 1, win 502, options [nop,nop,TS val 3319780883 ecr 2052464730], length 0
+13:59:32.828602 IP (tos 0x0, ttl 64, id 59455, offset 0, flags [DF], proto TCP (6), length 132)
+    198.19.15.254.57064 > 198.19.0.1.30180: Flags [P.], cksum 0xa09d (correct), seq 1:81, ack 1, win 502, options [nop,nop,TS val 3319780883 ecr 2052464730], length 80
+13:59:32.829986 IP (tos 0x0, ttl 62, id 33835, offset 0, flags [DF], proto TCP (6), length 52)
+    198.19.0.1.30180 > 198.19.15.254.57064: Flags [.], cksum 0x533b (correct), ack 81, win 509, options [nop,nop,TS val 2052464732 ecr 3319780883], length 0
+13:59:32.853492 IP (tos 0x0, ttl 62, id 33836, offset 0, flags [DF], proto TCP (6), length 69)
+    198.19.0.1.30180 > 198.19.15.254.57064: Flags [P.], cksum 0x9345 (correct), seq 1:18, ack 81, win 509, options [nop,nop,TS val 2052464756 ecr 3319780883], length 17
+13:59:32.853517 IP (tos 0x0, ttl 62, id 33837, offset 0, flags [DF], proto TCP (6), length 784)
+    198.19.0.1.30180 > 198.19.15.254.57064: Flags [FP.], cksum 0x037f (correct), seq 18:750, ack 81, win 509, options [nop,nop,TS val 2052464756 ecr 3319780883], length 732
+13:59:32.855113 IP (tos 0x0, ttl 64, id 59456, offset 0, flags [DF], proto TCP (6), length 52)
+    198.19.15.254.57064 > 198.19.0.1.30180: Flags [.], cksum 0x52ff (correct), ack 18, win 502, options [nop,nop,TS val 3319780909 ecr 2052464756], length 0
+13:59:32.855323 IP (tos 0x0, ttl 64, id 59457, offset 0, flags [DF], proto TCP (6), length 52)
+    198.19.15.254.57064 > 198.19.0.1.30180: Flags [.], cksum 0x5023 (correct), ack 751, win 501, options [nop,nop,TS val 3319780909 ecr 2052464756], length 0
+13:59:32.857380 IP (tos 0x0, ttl 64, id 59458, offset 0, flags [DF], proto TCP (6), length 52)
+    198.19.15.254.57064 > 198.19.0.1.30180: Flags [F.], cksum 0x5021 (correct), seq 81, ack 751, win 501, options [nop,nop,TS val 3319780910 ecr 2052464756], length 0
+13:59:32.860678 IP (tos 0x0, ttl 62, id 0, offset 0, flags [DF], proto TCP (6), length 52)
+    198.19.0.1.30180 > 198.19.15.254.57064: Flags [.], cksum 0x5012 (correct), ack 82, win 509, options [nop,nop,TS val 2052464763 ecr 3319780910], length 0
+```
+
+You can see there is traffic flowing via the node port in both directions. In this example:
+
+= Traffic from host1 to the node port: 198.19.15.254.57064 > 198.19.0.1.30180 
+- Traffic from the node port to host1: 198.19.0.1.30180 > 198.19.15.254.57064 
+Leave the tcpdump command running and we’ll see what difference turning on DSR makes.
+
+### Switch on DSR
+
+Run the following command from host1 to turn on DSR:
+```
+# calicoctl patch felixconfiguration default --patch='{"spec": {"bpfExternalServiceMode": "DSR"}}'
+```
+Now access YAO Bank from host1 using the node port via the control node:
+```
+curl 198.19.0.1:30180
+```
+
+The traffic will get logged by the tcpdump, for example:
+```
+    198.19.15.254.56898 > 198.19.0.1.30180: Flags [S], cksum 0xf4ce (correct), seq 3085566351, win 64240, options [mss 1460,sackOK,TS val 3319654555 ecr 0,nop,wscale 7], length 0
+13:57:26.502803 IP (tos 0x0, ttl 64, id 29496, offset 0, flags [DF], proto TCP (6), length 52)
+    198.19.15.254.56898 > 198.19.0.1.30180: Flags [.], cksum 0xfa75 (correct), ack 3427182734, win 502, options [nop,nop,TS val 3319654556 ecr 2052338405], length 0
+13:57:26.503215 IP (tos 0x0, ttl 64, id 29497, offset 0, flags [DF], proto TCP (6), length 132)
+    198.19.15.254.56898 > 198.19.0.1.30180: Flags [P.], cksum 0x477e (correct), seq 0:80, ack 1, win 502, options [nop,nop,TS val 3319654557 ecr 2052338405], length 80
+13:57:31.558591 IP (tos 0x0, ttl 64, id 29498, offset 0, flags [DF], proto TCP (6), length 52)
+    198.19.15.254.56898 > 198.19.0.1.30180: Flags [.], cksum 0xd293 (correct), ack 18, win 502, options [nop,nop,TS val 3319659613 ecr 2052343461], length 0
+13:57:31.558592 IP (tos 0x0, ttl 64, id 29499, offset 0, flags [DF], proto TCP (6), length 52)
+    198.19.15.254.56898 > 198.19.0.1.30180: Flags [.], cksum 0xcfb7 (correct), ack 751, win 501, options [nop,nop,TS val 3319659613 ecr 2052343461], length 0
+13:57:31.559193 IP (tos 0x0, ttl 64, id 29500, offset 0, flags [DF], proto TCP (6), length 52)
+    198.19.15.254.56898 > 198.19.0.1.30180: Flags [F.], cksum 0xcfb6 (correct), seq 80, ack 751, win 501, options [nop,nop,TS val 3319659613 ecr 2052343461], length 0
+```
+You should only see traffic in one direction, from host1 to the node port on the control node. The return traffic is going directly back to the client (host1) from the node hosting the customer pod backing the service (node1).
+
+## Introduction to Advertising Services
+
+- One alternative to using node ports, or load balancers, is to advertise service IP addresses over BGP.
+- This reuires the cluster to be running on an underlying network that supports BGP, which typically means an onprem or private cloud deployment, with standard top of rack routers.
+
+![image](https://github.com/user-attachments/assets/5d8aceec-8d4c-4fa3-9f6c-c2f7433e60e0)
+
+- Conceptually, removing the need for an external load balancer, and instead making the whole of your network service aware, and using your network routers to do the load balancing.
+- When used in conjunction with Calico eBPF native service handling, this provides even load balancing that's independent of the topology of your network and preserves client source IP addresses all the way to the backing pod.
+
+![image](https://github.com/user-attachments/assets/fe3307e8-94b0-4418-98ea-15bc8685083f)
+
+###  Advertise Cluster IP Range
+
+Advertising services over BGP allows you to directly access the service without using NodePorts or a cluster Ingress Controller.
+
+Examine routes
+
+Host1
+```
+ip route
+
+default via 192.168.159.113 dev eth0 proto dhcp src 192.168.159.121 metric 100
+192.168.159.112/28 dev eth0 proto kernel scope link src 192.168.159.121
+192.168.159.113 dev eth0 proto dhcp scope link src 192.168.159.121 metric 100
+198.19.0.0/20 dev eth0 proto kernel scope link src 198.19.15.254
+198.19.28.208/29 via 198.19.0.2 dev eth0 proto bird
+```
+
+- You can see one route that was learned from Calico that provides access to the nginx pod that was created in the externally routable namespace (the route ending in “proto bird”, the last line in this example output). In this lab we will advertise Kubernetes services (rather than individual pods) over BGP.
+
+### Update Calico BGP configuration
+
+The serviceClusterIPs clause below tells Calico to advertise the cluster IP range.
+
+Apply the configuration:
+```
+cat <<EOF | calicoctl apply -f -
+---
+apiVersion: projectcalico.org/v3
+kind: BGPConfiguration
+metadata:
+  name: default
+spec:
+  serviceClusterIPs:
+  - cidr: "198.19.32.0/20"
+EOF
+```
+Verify the BGPConfiguration update worked and contains the serviceClusterIPs key:
+```
+# calicoctl get bgpconfig default -o yaml
+
+apiVersion: projectcalico.org/v3
+kind: BGPConfiguration
+metadata:
+  creationTimestamp: "2020-10-19T21:16:09Z"
+  name: default
+  resourceVersion: "30335"
+  uid: 2bd1a883-4425-4274-a8ce-fe706de98e6a
+spec:
+  serviceClusterIPs:
+  - cidr: 198.19.32.0/20
+```
+
+Examine routes
+```
+ip route
+
+default via 192.168.159.113 dev eth0 proto dhcp src 192.168.159.117 metric 100
+192.168.159.112/28 dev eth0 proto kernel scope link src 192.168.159.117
+192.168.159.113 dev eth0 proto dhcp scope link src 192.168.159.117 metric 100
+198.19.0.0/20 dev eth0 proto kernel scope link src 198.19.15.254
+198.19.28.208/29 via 198.19.0.2 dev eth0 proto bird
+198.19.32.0/20 proto bird
+        nexthop via 198.19.0.1 dev eth0 weight 1
+        nexthop via 198.19.0.2 dev eth0 weight 1
+        nexthop via 198.19.0.3 dev eth0 weight 1
+
+```
+
+You should now see the cluster service cidr 198.19.32.0/20 advertised from each of the kubernetes cluster nodes. This means that traffic to any service's cluster IP address will get load balanced across all nodes in the cluster by the network using ECMP (Equal Cost Multi Path). Kube-proxy or Calico native service handling then load balances the cluster IP across the service endpoints (backing pods) in exactly the same way as if a pod had accessed a service via a cluster IP.
+
+Verify we can access cluster IPs
+```
+kubectl get svc -n yaobank customer
+
+NAME       TYPE       CLUSTER-IP      EXTERNAL-IP   PORT(S)        AGE
+customer   NodePort   198.19.35.118   <none>        80:30180/TCP   33m
+
+```
+
+Confirm we can access it from host1:
+```
+curl 198.19.35.118
+```
+
+Advertising Cluster IPs in this way provides an alternative to accessing services via Node Ports (simplifying client service discovery without clients needing to understand DNS SRV records) or external network load balancers (reducing overall equipment costs).  
+
+### Advertise External IPs
+
+If you want to advertise a service using an IP address outside of the service cluster IP range, you can configure the service to have one or more external-IPs.
+
+Examine the existing services
+```
+kubectl get svc -n yaobank
+
+NAME       TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)        AGE
+database   ClusterIP   198.19.45.32    <none>        2379/TCP       4m2s
+summary    ClusterIP   198.19.38.28    <none>        80/TCP         4m2s
+customer   NodePort    198.19.35.118   <none>        80:30180/TCP   4m1s
+```
+Note that none of them currently have an EXTERNAL-IP.
+
+### Update BGP configuration
+
+Update the Calico BGP configuration to advertise a service external IP CIDR range of 198.19.48.0/20:
+```
+calicoctl patch BGPConfig default --patch \
+   '{"spec": {"serviceExternalIPs": [{"cidr": "198.19.48.0/20"}]}}'
+```
+Note that serviceExternalIPs is a list of CIDRs, so you could for example add individual /32 IP addresses if there were just a small number of specific IPs you wanted to advertise.
+
+Examine routes on host1:
+
+```
+ip route
+
+default via 192.168.159.113 dev eth0 proto dhcp src 192.168.159.117 metric 100
+192.168.159.112/28 dev eth0 proto kernel scope link src 192.168.159.117
+192.168.159.113 dev eth0 proto dhcp scope link src 192.168.159.117 metric 100
+198.19.0.0/20 dev eth0 proto kernel scope link src 198.19.15.254
+198.19.28.208/29 via 198.19.0.2 dev eth0 proto bird
+198.19.32.0/20 proto bird
+        nexthop via 198.19.0.1 dev eth0 weight 1
+        nexthop via 198.19.0.2 dev eth0 weight 1
+        nexthop via 198.19.0.3 dev eth0 weight 1
+198.19.38.11 via 198.19.0.2 dev eth0 proto bird
+198.19.48.0/20 proto bird
+        nexthop via 198.19.0.1 dev eth0 weight 1
+        nexthop via 198.19.0.2 dev eth0 weight 1
+        nexthop via 198.19.0.3 dev eth0 weight 1
+```
+
+You should now have a route for the external ID CIDR (198.19.48.0/20) with next hops to each of our cluster nodes.
+
+###   Assign the service external IP
+
+Assign the service external IP 198.19.48.10/20 to the customer service.
+
+```
+kubectl patch svc -n yaobank customer -p  '{"spec": {"externalIPs": ["198.19.48.10"]}}'
+```
+
+Examine the services again to validate everything is as expected:
+```
+kubectl get svc -n yaobank
+
+NAME       TYPE        CLUSTER-IP      EXTERNAL-IP    PORT(S)        AGE
+database   ClusterIP   198.19.42.125   <none>         2379/TCP       32m
+summary    ClusterIP   198.19.32.103   <none>         80/TCP         32m
+customer   NodePort    198.19.38.11    198.19.48.10   80:30180/TCP   32m
+```
+
+You should now see the external ip (198.19.48.10) assigned to the customer service. We can now access the customer service from outside the cluster using the external ip address (198.19.48.10) we just assigned.
+
+Verify we can access the service's external IP- Connect to the customer service from the standalone node using the service external IP 198.19.48.10:
+```
+curl 198.19.48.10
+```
+As you can see the service has been made available outside of the cluster via bgp routing and network load balancing.
+
+
+We've covered five different ways for connecting to your pods from outside the cluster during this Module.
+
+- Via a standard NodePort on a specific node. (This is how you connected to the YAO Bank web front end when you first deployed it.)
+- Direct to the pod IP address by using externally routable IP Pools.
+- Advertising the service cluster IP range. (And using ECMP to load balance across all nodes in the cluster.)
+- Advertising individual cluster IPs. (Services with externalTrafficPolicy: Local, using ECMP to load balance only to the nodes hosting the pods backing the service.)
+- Advertising service external-IPs. (So you can use service IP addresses outside of the cluster IP range.)
 
 --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
